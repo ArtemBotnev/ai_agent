@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Агент</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">AI</div>
+        <div>
+          <p class="eyebrow">Python agent</p>
+          <h1>LLM Агент</h1>
+        </div>
+      </div>
+      <div class="topbar-meta">
+        <div class="model-badge" aria-label="Версия LLM">
+          <span>Модель</span>
+          <strong id="model-name">...</strong>
+        </div>
+        <div class="status" id="status">Готов</div>
+      </div>
+    </header>
+
+    <section class="chat" aria-label="История сообщений">
+      <div class="message-list" id="messages">
+        <div class="message agent">
+          <div class="avatar">A</div>
+          <div class="message-bubble">
+            <span class="message-author">Агент</span>
+            <span class="message-text">Здравствуйте. Напишите запрос, и я отправлю его в LLM через агента.</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <form class="composer" id="chat-form">
+      <textarea id="message-input" name="message" placeholder="Введите сообщение" autocomplete="off" required></textarea>
+      <button id="send-button" type="submit">Отправить</button>
+    </form>
+  </main>
+</body>
+</html>
