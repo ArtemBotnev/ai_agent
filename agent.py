@@ -1,25 +1,18 @@
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from application.agent_error import AgentError, AgentErrorCode
+from domain.message import Message
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_MODEL_ENV = "OPENAI_MODEL"
 DEFAULT_OPENAI_MODEL = "gpt-5"
 OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and concisely."
-
-
-class AgentErrorCode(Enum):
-    EMPTY_MESSAGE = "empty_message"
-    HTTP_ERROR = "http_error"
-    CONNECTION_ERROR = "connection_error"
-    TIMEOUT = "timeout"
-    INVALID_JSON = "invalid_json"
-    MISSING_OUTPUT_TEXT = "missing_output_text"
-    INCOMPLETE_RESPONSE = "incomplete_response"
 
 
 class AgentEvent(Enum):
@@ -30,22 +23,6 @@ class AgentEvent(Enum):
 AgentEventCallback = Callable[[AgentEvent], None]
 
 
-class AgentError(Exception):
-    def __init__(
-        self,
-        code: AgentErrorCode,
-        *,
-        details: str | None = None,
-        status_code: int | None = None,
-        response_status: str | None = None,
-    ) -> None:
-        self.code = code
-        self.details = details
-        self.status_code = status_code
-        self.response_status = response_status
-        super().__init__(code.value)
-
-
 @dataclass
 class SimpleLlmAgent:
     api_key: str
@@ -54,14 +31,14 @@ class SimpleLlmAgent:
     api_url: str = OPENAI_RESPONSES_API_URL
     on_event: AgentEventCallback | None = None
 
-    def ask(self, user_message: str) -> str:
-        if not user_message.strip():
+    def ask(self, messages: Sequence[Message]) -> str:
+        if not messages:
             raise AgentError(AgentErrorCode.EMPTY_MESSAGE)
 
         payload = {
             "model": self.model,
             "instructions": self.system_prompt,
-            "input": user_message,
+            "input": [message.to_dict() for message in messages],
         }
 
         self._emit(AgentEvent.REQUEST_STARTED)

@@ -6,9 +6,21 @@ const button = document.getElementById('send-button');
 const modelName = document.getElementById('model-name');
 const defaultModelName = 'gpt-5';
 
+function clearMessages() {
+  messages.replaceChildren();
+}
+
+function getMessageView(role) {
+  if (role === 'user') {
+    return { kind: 'user', author: 'Вы' };
+  }
+
+  return { kind: 'agent', author: 'Агент' };
+}
+
 function appendMessage(kind, author, text) {
   const item = document.createElement('div');
-  item.className = `message ${kind}`;
+  item.className = 'message ' + kind;
 
   const avatar = document.createElement('div');
   avatar.className = 'avatar';
@@ -35,6 +47,29 @@ function setLoading(isLoading) {
   button.disabled = isLoading;
   input.disabled = isLoading;
   status.textContent = isLoading ? 'Запрос...' : 'Готов';
+}
+
+async function loadMessages() {
+  try {
+    const response = await fetch('/api/messages');
+    const data = await response.json();
+
+    if (!response.ok || !Array.isArray(data.messages) || data.messages.length === 0) {
+      return;
+    }
+
+    clearMessages();
+    for (const message of data.messages) {
+      if (!message || typeof message.content !== 'string') {
+        continue;
+      }
+
+      const view = getMessageView(message.role);
+      appendMessage(view.kind, view.author, message.content);
+    }
+  } catch (error) {
+    return;
+  }
 }
 
 async function loadConfig() {
@@ -83,3 +118,4 @@ form.addEventListener('submit', async (event) => {
 });
 
 loadConfig();
+loadMessages();

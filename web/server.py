@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from agent import AgentError, AgentErrorCode, DEFAULT_OPENAI_MODEL, OPENAI_MODEL_ENV
-from main import AGENT_ERROR_MESSAGES, build_agent, format_agent_error
+from agent import DEFAULT_OPENAI_MODEL, OPENAI_MODEL_ENV
+from application.agent_error import AgentError, AgentErrorCode
+from main import AGENT_ERROR_MESSAGES, build_chat_service, build_history_repository, format_agent_error
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -37,6 +38,10 @@ class WebChatHandler(BaseHTTPRequestHandler):
             self._send_json({"model": get_model_name()}, HTTPStatus.OK, include_body=include_body)
             return
 
+        if path == "/api/messages":
+            self._handle_messages_request(include_body=include_body)
+            return
+
         if path.startswith("/static/"):
             self._send_static_file(path, include_body=include_body)
             return
@@ -62,8 +67,8 @@ class WebChatHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            agent = build_agent()
-            answer = agent.ask(message)
+            chat_service = build_chat_service()
+            answer = chat_service.answer(message)
         except RuntimeError as error:
             self._send_json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -75,6 +80,11 @@ class WebChatHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         return
+
+    def _handle_messages_request(self, *, include_body: bool) -> None:
+        history_repository = build_history_repository()
+        messages = [message.to_dict() for message in history_repository.load()]
+        self._send_json({"messages": messages}, HTTPStatus.OK, include_body=include_body)
 
     def _read_json_body(self) -> dict[str, Any] | None:
         content_length = self.headers.get("Content-Length")

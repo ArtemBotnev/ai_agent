@@ -1,14 +1,21 @@
 import os
 import sys
+from pathlib import Path
 
 from agent import (
-    AgentError,
-    AgentErrorCode,
     DEFAULT_OPENAI_MODEL,
     OPENAI_API_KEY_ENV,
     OPENAI_MODEL_ENV,
     SimpleLlmAgent,
 )
+from application.agent_error import AgentError, AgentErrorCode
+from application.chat_service import ChatService
+from application.message_history_repository import MessageHistoryRepository
+from infrastructure.json_message_history_repository import JsonMessageHistoryRepository
+
+DEFAULT_HISTORY_FILE = Path("history/messages.json")
+AGENT_HISTORY_FILE_ENV = "AGENT_HISTORY_FILE"
+
 
 AGENT_ERROR_MESSAGES = {
     AgentErrorCode.EMPTY_MESSAGE: "Введите непустое сообщение.",
@@ -30,6 +37,18 @@ def build_agent() -> SimpleLlmAgent:
     return SimpleLlmAgent(api_key=api_key, model=model)
 
 
+def build_history_repository() -> MessageHistoryRepository:
+    history_file = Path(os.getenv(AGENT_HISTORY_FILE_ENV, str(DEFAULT_HISTORY_FILE)))
+    return JsonMessageHistoryRepository(history_file)
+
+
+def build_chat_service() -> ChatService:
+    return ChatService(
+        agent=build_agent(),
+        history_repository=build_history_repository(),
+    )
+
+
 def format_agent_error(error: AgentError) -> str:
     message = AGENT_ERROR_MESSAGES.get(error.code, "Произошла неизвестная ошибка агента.")
 
@@ -45,7 +64,7 @@ def format_agent_error(error: AgentError) -> str:
     return message
 
 
-def run_chat(agent: SimpleLlmAgent) -> None:
+def run_chat(chat_service: ChatService) -> None:
     print("Простой CLI-чат с LLM-агентом")
     print("Введите сообщение и нажмите Enter. Для выхода напишите 'exit' или 'quit'.")
 
@@ -65,7 +84,7 @@ def run_chat(agent: SimpleLlmAgent) -> None:
             continue
 
         try:
-            answer = agent.ask(user_message)
+            answer = chat_service.answer(user_message)
         except AgentError as error:
             print(f"Ошибка агента: {format_agent_error(error)}", file=sys.stderr)
             continue
@@ -75,12 +94,12 @@ def run_chat(agent: SimpleLlmAgent) -> None:
 
 def main() -> None:
     try:
-        agent = build_agent()
+        chat_service = build_chat_service()
     except RuntimeError as error:
         print(f"Ошибка конфигурации: {error}", file=sys.stderr)
         sys.exit(1)
 
-    run_chat(agent)
+    run_chat(chat_service)
 
 
 if __name__ == "__main__":
