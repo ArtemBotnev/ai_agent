@@ -68,7 +68,7 @@ class WebChatHandler(BaseHTTPRequestHandler):
 
         try:
             chat_service = build_chat_service()
-            answer = chat_service.answer(message)
+            response = chat_service.answer(message)
         except RuntimeError as error:
             self._send_json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -76,7 +76,17 @@ class WebChatHandler(BaseHTTPRequestHandler):
             self._send_json({"error": format_agent_error(error)}, HTTPStatus.BAD_GATEWAY)
             return
 
-        self._send_json({"answer": answer}, HTTPStatus.OK)
+        self._send_json(
+            {
+                "answer": response.text,
+                "tokens": {
+                    "current_request": response.tokens.current_request,
+                    "history": response.tokens.history,
+                    "response": response.tokens.response,
+                },
+            },
+            HTTPStatus.OK,
+        )
 
     def log_message(self, format: str, *args: Any) -> None:
         return

@@ -24,6 +24,7 @@ AGENT_ERROR_MESSAGES = {
     AgentErrorCode.TIMEOUT: "Истекло время ожидания ответа от LLM API.",
     AgentErrorCode.INVALID_JSON: "LLM API вернул некорректный JSON.",
     AgentErrorCode.MISSING_OUTPUT_TEXT: "В ответе LLM API не найден текст ответа.",
+    AgentErrorCode.MISSING_TOKEN_USAGE: "LLM API не вернул данные о токенах.",
     AgentErrorCode.INCOMPLETE_RESPONSE: "LLM API вернул незавершенный ответ без текста.",
 }
 
@@ -84,12 +85,18 @@ def run_chat(chat_service: ChatService) -> None:
             continue
 
         try:
-            answer = chat_service.answer(user_message)
+            response = chat_service.answer(user_message)
         except AgentError as error:
             print(f"Ошибка агента: {format_agent_error(error)}", file=sys.stderr)
             continue
 
-        print(f"Агент: {answer}")
+        print(f"Агент: {response.text}")
+        print(
+            "Токены: "
+            f"текущий запрос — {response.tokens.current_request}, "
+            f"история — {response.tokens.history}, "
+            f"ответ — {response.tokens.response}"
+        )
 
 
 def main() -> None:

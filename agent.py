@@ -6,12 +6,15 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from application.agent_error import AgentError, AgentErrorCode
+from application.llm_agent import LlmAnswer
 from domain.message import Message
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_MODEL_ENV = "OPENAI_MODEL"
-DEFAULT_OPENAI_MODEL = "gpt-5"
+# DEFAULT_OPENAI_MODEL = "gpt-5"
+DEFAULT_OPENAI_MODEL = "gpt-3.5-turbo-0125"
 OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses"
+OPENAI_RESPONSES_INPUT_TOKENS_API_URL = "https://api.openai.com/v1/responses/input_tokens"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and concisely."
 
 
@@ -29,9 +32,21 @@ class SimpleLlmAgent:
     model: str = DEFAULT_OPENAI_MODEL
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     api_url: str = OPENAI_RESPONSES_API_URL
+    input_tokens_api_url: str = OPENAI_RESPONSES_INPUT_TOKENS_API_URL
     on_event: AgentEventCallback | None = None
 
-    def ask(self, messages: Sequence[Message]) -> str:
+    def count_tokens(self, messages: Sequence[Message]) -> int:
+        if not messages:
+            return 0
+
+        payload = {
+            "model": self.model,
+            "input": [message.to_dict() for message in messages],
+        }
+        response_data = self._post_json(payload, self.input_tokens_api_url)
+        return self._extract_input_tokens(response_data)
+
+    def ask(self, messages: Sequence[Message]) -> LlmAnswer:
         if not messages:
             raise AgentError(AgentErrorCode.EMPTY_MESSAGE)
 
@@ -43,8 +58,11 @@ class SimpleLlmAgent:
 
         self._emit(AgentEvent.REQUEST_STARTED)
         try:
-            response_data = self._post_json(payload)
-            return self._extract_text(response_data)
+            response_data = self._post_json(payload, self.api_url)
+            return LlmAnswer(
+                text=self._extract_text(response_data),
+                response_tokens=self._extract_output_tokens(response_data),
+            )
         finally:
             self._emit(AgentEvent.REQUEST_FINISHED)
 
@@ -52,10 +70,10 @@ class SimpleLlmAgent:
         if self.on_event is not None:
             self.on_event(event)
 
-    def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_json(self, payload: dict[str, Any], api_url: str) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
         request = Request(
-            self.api_url,
+            api_url,
             data=body,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -86,6 +104,24 @@ class SimpleLlmAgent:
             return json.loads(raw_body)
         except json.JSONDecodeError as error:
             raise AgentError(AgentErrorCode.INVALID_JSON) from error
+
+    def _extract_input_tokens(self, response_data: dict[str, Any]) -> int:
+        input_tokens = response_data.get("input_tokens")
+        if isinstance(input_tokens, int) and input_tokens >= 0:
+            return input_tokens
+
+        raise AgentError(AgentErrorCode.MISSING_TOKEN_USAGE)
+
+    def _extract_output_tokens(self, response_data: dict[str, Any]) -> int:
+        usage = response_data.get("usage")
+        if not isinstance(usage, dict):
+            return 0
+
+        output_tokens = usage.get("output_tokens")
+        if isinstance(output_tokens, int) and output_tokens >= 0:
+            return output_tokens
+
+        return 0
 
     def _extract_text(self, response_data: dict[str, Any]) -> str:
         direct_output_text = response_data.get("output_text")

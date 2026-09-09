@@ -225,6 +225,13 @@ h1 {
   font-weight: 700;
 }
 
+.message-meta {
+  padding-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.25;
+}
+
 .message.error .message-author {
   color: var(--error-text);
 }

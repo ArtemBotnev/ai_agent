@@ -8,6 +8,7 @@ class AgentErrorCode(Enum):
     TIMEOUT = "timeout"
     INVALID_JSON = "invalid_json"
     MISSING_OUTPUT_TEXT = "missing_output_text"
+    MISSING_TOKEN_USAGE = "missing_token_usage"
     INCOMPLETE_RESPONSE = "incomplete_response"
 
 

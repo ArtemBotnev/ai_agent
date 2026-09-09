@@ -18,7 +18,7 @@ function getMessageView(role) {
   return { kind: 'agent', author: 'Агент' };
 }
 
-function appendMessage(kind, author, text) {
+function appendMessage(kind, author, text, metaText = '') {
   const item = document.createElement('div');
   item.className = 'message ' + kind;
 
@@ -38,9 +38,31 @@ function appendMessage(kind, author, text) {
   textElement.textContent = text;
 
   bubble.append(authorElement, textElement);
+  if (metaText) {
+    const metaElement = document.createElement('span');
+    metaElement.className = 'message-meta';
+    metaElement.textContent = metaText;
+    bubble.appendChild(metaElement);
+  }
+
   item.append(avatar, bubble);
   messages.appendChild(item);
   item.scrollIntoView({ block: 'end', behavior: 'smooth' });
+}
+
+function getTokenMeta(tokens) {
+  if (!tokens || typeof tokens !== 'object') {
+    return '';
+  }
+
+  const currentRequest = Number(tokens.current_request);
+  const history = Number(tokens.history);
+  const response = Number(tokens.response);
+  if (![currentRequest, history, response].every(Number.isFinite)) {
+    return '';
+  }
+
+  return `Токены: запрос ${currentRequest} · история ${history} · ответ ${response}`;
 }
 
 function setLoading(isLoading) {
@@ -108,7 +130,7 @@ form.addEventListener('submit', async (event) => {
       return;
     }
 
-    appendMessage('agent', 'Агент', data.answer);
+    appendMessage('agent', 'Агент', data.answer, getTokenMeta(data.tokens));
   } catch (error) {
     appendMessage('error', 'Ошибка', 'Не удалось подключиться к web-серверу.');
   } finally {
