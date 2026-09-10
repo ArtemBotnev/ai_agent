@@ -6,8 +6,9 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from application.agent_error import AgentError, AgentErrorCode
+from application.conversation_summarizer import ConversationSummarizer
 from application.llm_agent import LlmAnswer
-from domain.message import Message
+from domain.message import USER_ROLE, Message
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_MODEL_ENV = "OPENAI_MODEL"
@@ -16,6 +17,12 @@ DEFAULT_OPENAI_MODEL = "gpt-3.5-turbo-0125"
 OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_RESPONSES_INPUT_TOKENS_API_URL = "https://api.openai.com/v1/responses/input_tokens"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and concisely."
+SUMMARY_SYSTEM_PROMPT = (
+    "You summarize earlier chat messages for future context. "
+    "Keep stable facts, user preferences, decisions, constraints, open tasks, "
+    "and important technical details. Do not invent details."
+)
+SUMMARY_CONTEXT_LABEL = "Summary of earlier conversation:"
 
 
 class AgentEvent(Enum):
@@ -35,7 +42,7 @@ class SimpleLlmAgent:
     input_tokens_api_url: str = OPENAI_RESPONSES_INPUT_TOKENS_API_URL
     on_event: AgentEventCallback | None = None
 
-    def count_tokens(self, messages: Sequence[Message]) -> int:
+    def count_tokens(self, messages: Sequence[Message], *, summary: str = "") -> int:
         if not messages:
             return 0
 
@@ -43,16 +50,19 @@ class SimpleLlmAgent:
             "model": self.model,
             "input": [message.to_dict() for message in messages],
         }
+        if summary.strip():
+            payload["instructions"] = self._build_instructions(summary)
+
         response_data = self._post_json(payload, self.input_tokens_api_url)
         return self._extract_input_tokens(response_data)
 
-    def ask(self, messages: Sequence[Message]) -> LlmAnswer:
+    def ask(self, messages: Sequence[Message], *, summary: str = "") -> LlmAnswer:
         if not messages:
             raise AgentError(AgentErrorCode.EMPTY_MESSAGE)
 
         payload = {
             "model": self.model,
-            "instructions": self.system_prompt,
+            "instructions": self._build_instructions(summary),
             "input": [message.to_dict() for message in messages],
         }
 
@@ -69,6 +79,13 @@ class SimpleLlmAgent:
     def _emit(self, event: AgentEvent) -> None:
         if self.on_event is not None:
             self.on_event(event)
+
+    def _build_instructions(self, summary: str = "") -> str:
+        clean_summary = summary.strip()
+        if not clean_summary:
+            return self.system_prompt
+
+        return f"{self.system_prompt}\n\n{SUMMARY_CONTEXT_LABEL}\n{clean_summary}"
 
     def _post_json(self, payload: dict[str, Any], api_url: str) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
@@ -164,3 +181,30 @@ class SimpleLlmAgent:
                     text_parts.append(text.strip())
 
         return text_parts
+
+
+@dataclass
+class SimpleConversationSummarizer(ConversationSummarizer):
+    agent: SimpleLlmAgent
+
+    def summarize(self, previous_summary: str, messages: Sequence[Message]) -> str:
+        if not messages:
+            return previous_summary.strip()
+
+        prompt = self._build_prompt(previous_summary, messages)
+        answer = self.agent.ask([Message(role=USER_ROLE, content=prompt)])
+        return answer.text
+
+    def _build_prompt(self, previous_summary: str, messages: Sequence[Message]) -> str:
+        messages_text = "\n".join(
+            f"{index}. {message.role}: {message.content}"
+            for index, message in enumerate(messages, start=1)
+        )
+
+        clean_previous_summary = previous_summary.strip() or "No previous summary."
+        return (
+            "Update the conversation summary using the previous summary and the new messages.\n\n"
+            f"Previous summary:\n{clean_previous_summary}\n\n"
+            f"New messages to summarize:\n{messages_text}\n\n"
+            "Return only the updated summary."
+        )

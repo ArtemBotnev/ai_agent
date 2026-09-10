@@ -11,8 +11,8 @@ class LlmAnswer:
 
 
 class LlmAgent(Protocol):
-    def count_tokens(self, messages: Sequence[Message]) -> int:
+    def count_tokens(self, messages: Sequence[Message], *, summary: str = "") -> int:
         ...
 
-    def ask(self, messages: Sequence[Message]) -> LlmAnswer:
+    def ask(self, messages: Sequence[Message], *, summary: str = "") -> LlmAnswer:
         ...

@@ -6,15 +6,23 @@ from agent import (
     DEFAULT_OPENAI_MODEL,
     OPENAI_API_KEY_ENV,
     OPENAI_MODEL_ENV,
+    SUMMARY_SYSTEM_PROMPT,
+    SimpleConversationSummarizer,
     SimpleLlmAgent,
 )
 from application.agent_error import AgentError, AgentErrorCode
-from application.chat_service import ChatService
+from application.chat_service import DEFAULT_RECENT_MESSAGES_LIMIT, ChatService
 from application.message_history_repository import MessageHistoryRepository
+from application.conversation_summary_repository import ConversationSummaryRepository
+from application.conversation_summarizer import ConversationSummarizer
+from infrastructure.json_conversation_summary_repository import JsonConversationSummaryRepository
 from infrastructure.json_message_history_repository import JsonMessageHistoryRepository
 
 DEFAULT_HISTORY_FILE = Path("history/messages.json")
+DEFAULT_SUMMARY_FILE = Path("history/summary.json")
 AGENT_HISTORY_FILE_ENV = "AGENT_HISTORY_FILE"
+AGENT_SUMMARY_FILE_ENV = "AGENT_SUMMARY_FILE"
+AGENT_RECENT_MESSAGES_LIMIT_ENV = "AGENT_RECENT_MESSAGES_LIMIT"
 
 
 AGENT_ERROR_MESSAGES = {
@@ -30,12 +38,28 @@ AGENT_ERROR_MESSAGES = {
 
 
 def build_agent() -> SimpleLlmAgent:
+    return SimpleLlmAgent(api_key=get_api_key(), model=get_model_name())
+
+
+def build_summarizer() -> ConversationSummarizer:
+    summary_agent = SimpleLlmAgent(
+        api_key=get_api_key(),
+        model=get_model_name(),
+        system_prompt=SUMMARY_SYSTEM_PROMPT,
+    )
+    return SimpleConversationSummarizer(summary_agent)
+
+
+def get_api_key() -> str:
     api_key = os.getenv(OPENAI_API_KEY_ENV)
     if not api_key:
         raise RuntimeError(f"Перед запуском чата задайте переменную окружения {OPENAI_API_KEY_ENV}.")
 
-    model = os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL)
-    return SimpleLlmAgent(api_key=api_key, model=model)
+    return api_key
+
+
+def get_model_name() -> str:
+    return os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL)
 
 
 def build_history_repository() -> MessageHistoryRepository:
@@ -43,10 +67,32 @@ def build_history_repository() -> MessageHistoryRepository:
     return JsonMessageHistoryRepository(history_file)
 
 
+def build_summary_repository() -> ConversationSummaryRepository:
+    summary_file = Path(os.getenv(AGENT_SUMMARY_FILE_ENV, str(DEFAULT_SUMMARY_FILE)))
+    return JsonConversationSummaryRepository(summary_file)
+
+
+def get_recent_messages_limit() -> int:
+    raw_limit = os.getenv(AGENT_RECENT_MESSAGES_LIMIT_ENV, str(DEFAULT_RECENT_MESSAGES_LIMIT))
+
+    try:
+        limit = int(raw_limit)
+    except ValueError as error:
+        raise RuntimeError(f"Переменная {AGENT_RECENT_MESSAGES_LIMIT_ENV} должна быть числом.") from error
+
+    if limit < 1:
+        raise RuntimeError(f"Переменная {AGENT_RECENT_MESSAGES_LIMIT_ENV} должна быть больше 0.")
+
+    return limit
+
+
 def build_chat_service() -> ChatService:
     return ChatService(
         agent=build_agent(),
         history_repository=build_history_repository(),
+        summary_repository=build_summary_repository(),
+        summarizer=build_summarizer(),
+        recent_messages_limit=get_recent_messages_limit(),
     )
 
 

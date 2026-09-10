@@ -1,4 +1,3 @@
-import html
 import os
 import sys
 from typing import Any
@@ -8,6 +7,8 @@ from application.agent_error import AgentError
 from application.chat_service import ChatResponse
 from domain.message import Message
 from main import build_chat_service, build_history_repository, format_agent_error
+from ui.message_html import AGENT_AUTHOR, ERROR_AUTHOR, USER_AUTHOR, render_message_html
+from ui.pyqt_theme import COMPOSER_HEIGHT, WINDOW_STYLESHEET
 
 
 def main() -> None:
@@ -28,6 +29,20 @@ def main() -> None:
     except ImportError:
         print("PyQt UI requires PyQt6. Install it with: python3 -m pip install PyQt6", file=sys.stderr)
         sys.exit(1)
+
+    class MessageInput(QTextEdit):
+        submit_requested = pyqtSignal()
+
+        def keyPressEvent(self, event: Any) -> None:
+            if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    super().keyPressEvent(event)
+                    return
+
+                self.submit_requested.emit()
+                return
+
+            super().keyPressEvent(event)
 
     class ChatWorker(QThread):
         answered = pyqtSignal(object)
@@ -58,7 +73,7 @@ def main() -> None:
             self._model_label = QLabel(f"Модель: {os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL)}")
             self._status_label = QLabel("Готов")
             self._messages = QTextBrowser()
-            self._input = QTextEdit()
+            self._input = MessageInput()
             self._send_button = QPushButton("Отправить")
 
             self._setup_ui()
@@ -67,8 +82,10 @@ def main() -> None:
         def _setup_ui(self) -> None:
             self._messages.setOpenExternalLinks(False)
             self._input.setPlaceholderText("Введите сообщение")
-            self._input.setFixedHeight(96)
+            self._input.setFixedHeight(COMPOSER_HEIGHT)
+            self._send_button.setFixedHeight(COMPOSER_HEIGHT)
             self._send_button.setFixedWidth(140)
+            self._input.submit_requested.connect(self._send_message)
             self._send_button.clicked.connect(self._send_message)
 
             header_layout = QHBoxLayout()
@@ -88,67 +105,7 @@ def main() -> None:
             root = QWidget()
             root.setLayout(root_layout)
             self.setCentralWidget(root)
-            self.setStyleSheet(
-                """
-                QMainWindow {
-                    background: #111827;
-                }
-                QLabel {
-                    color: #d1d5db;
-                    font-size: 14px;
-                }
-                QTextBrowser,
-                QTextEdit {
-                    border: 1px solid #374151;
-                    border-radius: 8px;
-                    background: #0f172a;
-                    color: #f9fafb;
-                    font-size: 15px;
-                    padding: 10px;
-                    selection-background-color: #2563eb;
-                    selection-color: #ffffff;
-                }
-                QPushButton {
-                    min-height: 42px;
-                    border: 0;
-                    border-radius: 8px;
-                    background: #2563eb;
-                    color: #ffffff;
-                    font-weight: 700;
-                    padding: 0 16px;
-                }
-                QPushButton:hover {
-                    background: #1d4ed8;
-                }
-                QPushButton:disabled {
-                    background: #4b5563;
-                    color: #cbd5e1;
-                }
-                QScrollBar:vertical {
-                    width: 12px;
-                    background: #111827;
-                    margin: 4px 2px 4px 2px;
-                }
-                QScrollBar::handle:vertical {
-                    min-height: 34px;
-                    border-radius: 6px;
-                    background: #4b5563;
-                }
-                QScrollBar::handle:vertical:hover {
-                    background: #64748b;
-                }
-                QScrollBar::add-line:vertical,
-                QScrollBar::sub-line:vertical {
-                    height: 0;
-                    border: 0;
-                    background: transparent;
-                }
-                QScrollBar::add-page:vertical,
-                QScrollBar::sub-page:vertical {
-                    background: transparent;
-                }
-                """
-            )
+            self.setStyleSheet(WINDOW_STYLESHEET)
 
         def _load_history(self) -> None:
             try:
@@ -158,7 +115,7 @@ def main() -> None:
                 return
 
             if not messages:
-                self._append_message("Агент", "Здравствуйте. Напишите запрос, и я отправлю его в LLM через агента.")
+                self._append_message(AGENT_AUTHOR, "Здравствуйте. Напишите запрос, и я отправлю его в LLM через агента.")
                 return
 
             for message in messages:
@@ -167,10 +124,10 @@ def main() -> None:
         def _send_message(self) -> None:
             text = self._input.toPlainText().strip()
             if not text:
-                self._append_message("Ошибка", "Введите непустое сообщение.")
+                self._append_message(ERROR_AUTHOR, "Введите непустое сообщение.")
                 return
 
-            self._append_message("Вы", text)
+            self._append_message(USER_AUTHOR, text)
             self._input.clear()
             self._set_loading(True)
 
@@ -183,7 +140,7 @@ def main() -> None:
         def _handle_answer(self, response: Any) -> None:
             chat_response = response
             if not isinstance(chat_response, ChatResponse):
-                self._append_message("Ошибка", "Агент вернул некорректный ответ.")
+                self._append_message(ERROR_AUTHOR, "Агент вернул некорректный ответ.")
                 return
 
             tokens = chat_response.tokens
@@ -191,10 +148,10 @@ def main() -> None:
                 f"Токены: запрос {tokens.current_request}, "
                 f"история {tokens.history}, ответ {tokens.response}"
             )
-            self._append_message("Агент", chat_response.text, meta)
+            self._append_message(AGENT_AUTHOR, chat_response.text, meta)
 
         def _handle_error(self, error: str) -> None:
-            self._append_message("Ошибка", error)
+            self._append_message(ERROR_AUTHOR, error)
 
         def _set_loading(self, is_loading: bool) -> None:
             self._send_button.setDisabled(is_loading)
@@ -202,37 +159,15 @@ def main() -> None:
             self._status_label.setText("Запрос..." if is_loading else "Готов")
 
         def _append_message(self, author: str, text: str, meta: str = "") -> None:
-            author_html = html.escape(author)
-            text_html = html.escape(text).replace("\n", "<br>")
-            author_color = "#93c5fd"
-            text_color = "#f9fafb"
-            if author == "Вы":
-                author_color = "#5eead4"
-            elif author == "Ошибка":
-                author_color = "#fca5a5"
-                text_color = "#fee2e2"
-
-            meta_html = ""
-            if meta:
-                meta_html = f'<div style="color:#94a3b8;font-size:12px;margin-top:6px;">{html.escape(meta)}</div>'
-
-            self._messages.append(
-                f"""
-                <div style="margin:12px 0;">
-                  <div style="color:{author_color};font-size:12px;font-weight:700;">{author_html}</div>
-                  <div style="color:{text_color};font-size:15px;line-height:1.45;margin-top:4px;">{text_html}</div>
-                  {meta_html}
-                </div>
-                """
-            )
+            self._messages.append(render_message_html(author, text, meta))
             scrollbar = self._messages.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
 
         def _message_author(self, message: Message) -> str:
             if message.role == "user":
-                return "Вы"
+                return USER_AUTHOR
 
-            return "Агент"
+            return AGENT_AUTHOR
 
     app = QApplication(sys.argv)
     window = ChatWindow()
