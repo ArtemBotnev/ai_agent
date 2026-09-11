@@ -8,7 +8,9 @@ from urllib.request import Request, urlopen
 from application.agent_error import AgentError, AgentErrorCode
 from application.conversation_summarizer import ConversationSummarizer
 from application.llm_agent import LlmAnswer
+from application.sticky_facts_extractor import StickyFactsExtractor
 from domain.message import USER_ROLE, Message
+from domain.sticky_facts import StickyFacts
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_MODEL_ENV = "OPENAI_MODEL"
@@ -22,7 +24,14 @@ SUMMARY_SYSTEM_PROMPT = (
     "Keep stable facts, user preferences, decisions, constraints, open tasks, "
     "and important technical details. Do not invent details."
 )
-SUMMARY_CONTEXT_LABEL = "Summary of earlier conversation:"
+ADDITIONAL_CONTEXT_LABEL = "Additional conversation context:"
+STICKY_FACTS_SYSTEM_PROMPT = (
+    "You update durable key-value memory for a chat agent. "
+    "Keep only stable facts that will help future replies: goals, constraints, "
+    "preferences, decisions, agreements, user profile, project details, and open tasks. "
+    "Preserve useful existing facts unless the new messages contradict them. "
+    "Remove obsolete facts."
+)
 
 
 class AgentEvent(Enum):
@@ -42,7 +51,7 @@ class SimpleLlmAgent:
     input_tokens_api_url: str = OPENAI_RESPONSES_INPUT_TOKENS_API_URL
     on_event: AgentEventCallback | None = None
 
-    def count_tokens(self, messages: Sequence[Message], *, summary: str = "") -> int:
+    def count_tokens(self, messages: Sequence[Message], *, context: str = "") -> int:
         if not messages:
             return 0
 
@@ -50,19 +59,19 @@ class SimpleLlmAgent:
             "model": self.model,
             "input": [message.to_dict() for message in messages],
         }
-        if summary.strip():
-            payload["instructions"] = self._build_instructions(summary)
+        if context.strip():
+            payload["instructions"] = self._build_instructions(context)
 
         response_data = self._post_json(payload, self.input_tokens_api_url)
         return self._extract_input_tokens(response_data)
 
-    def ask(self, messages: Sequence[Message], *, summary: str = "") -> LlmAnswer:
+    def ask(self, messages: Sequence[Message], *, context: str = "") -> LlmAnswer:
         if not messages:
             raise AgentError(AgentErrorCode.EMPTY_MESSAGE)
 
         payload = {
             "model": self.model,
-            "instructions": self._build_instructions(summary),
+            "instructions": self._build_instructions(context),
             "input": [message.to_dict() for message in messages],
         }
 
@@ -80,12 +89,12 @@ class SimpleLlmAgent:
         if self.on_event is not None:
             self.on_event(event)
 
-    def _build_instructions(self, summary: str = "") -> str:
-        clean_summary = summary.strip()
-        if not clean_summary:
+    def _build_instructions(self, context: str = "") -> str:
+        clean_context = context.strip()
+        if not clean_context:
             return self.system_prompt
 
-        return f"{self.system_prompt}\n\n{SUMMARY_CONTEXT_LABEL}\n{clean_summary}"
+        return f"{self.system_prompt}\n\n{ADDITIONAL_CONTEXT_LABEL}\n{clean_context}"
 
     def _post_json(self, payload: dict[str, Any], api_url: str) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
@@ -207,4 +216,92 @@ class SimpleConversationSummarizer(ConversationSummarizer):
             f"Previous summary:\n{clean_previous_summary}\n\n"
             f"New messages to summarize:\n{messages_text}\n\n"
             "Return only the updated summary."
+        )
+
+
+@dataclass
+class SimpleStickyFactsExtractor(StickyFactsExtractor):
+    agent: SimpleLlmAgent
+
+    def update(self, facts: StickyFacts, messages: Sequence[Message]) -> StickyFacts:
+        if not messages:
+            return facts
+
+        prompt = self._build_prompt(facts, messages)
+        answer = self.agent.ask([Message(role=USER_ROLE, content=prompt)])
+
+        raw_facts = self._parse_json_object(answer.text)
+        if raw_facts is None:
+            return facts
+
+        return self._merge_facts(facts, raw_facts)
+
+    def _parse_json_object(self, text: str) -> dict[str, object] | None:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            start_index = text.find("{")
+            end_index = text.rfind("}")
+            if start_index < 0 or end_index <= start_index:
+                return None
+
+            try:
+                parsed = json.loads(text[start_index : end_index + 1])
+            except json.JSONDecodeError:
+                return None
+
+        if not isinstance(parsed, dict):
+            return None
+
+        raw_items = parsed.get("items")
+        if isinstance(raw_items, dict):
+            return raw_items
+
+        return parsed
+
+    def _merge_facts(self, current_facts: StickyFacts, raw_updates: dict[str, object]) -> StickyFacts:
+        updated_items = dict(current_facts.items)
+
+        for key, value in raw_updates.items():
+            if not isinstance(key, str):
+                continue
+
+            clean_key = key.strip()
+            if not clean_key:
+                continue
+
+            if value is None:
+                updated_items.pop(clean_key, None)
+                continue
+
+            if not isinstance(value, str):
+                continue
+
+            clean_value = value.strip()
+            if clean_value:
+                updated_items[clean_key] = clean_value
+            else:
+                updated_items.pop(clean_key, None)
+
+        return StickyFacts(updated_items)
+
+    def _build_prompt(self, facts: StickyFacts, messages: Sequence[Message]) -> str:
+        facts_json = json.dumps(facts.items, ensure_ascii=False, indent=2)
+        messages_text = "\n".join(
+            f"{index}. {message.role}: {message.content}"
+            for index, message in enumerate(messages, start=1)
+        )
+
+        return (
+            "Update key-value memory using the current facts and recent messages.\n"
+            "Return only one JSON object. Keys must be strings. Values must be strings, "
+            "empty strings, or null.\n"
+            "Return every new or changed durable fact. Use null or an empty string to delete "
+            "a fact that became obsolete.\n"
+            "Keep separate facts as separate keys instead of compressing everything into one item.\n"
+            "Use concise keys such as goal, constraints, preferences, decisions, agreements, "
+            "user_profile, project_details, open_tasks, current_topic.\n"
+            "Do not repeat facts that are unchanged unless they help clarify the update.\n\n"
+            f"Current facts:\n{facts_json}\n\n"
+            f"Recent messages:\n{messages_text}"
         )

@@ -13,7 +13,8 @@ QLabel {
     font-size: 14px;
 }
 QTextBrowser,
-QTextEdit {
+QTextEdit,
+QComboBox {
     border: 1px solid __BORDER__;
     border-radius: 8px;
     background: __SURFACE__;
@@ -23,9 +24,11 @@ QTextEdit {
     selection-background-color: __ACCENT__;
     selection-color: __TEXT_ON_ACCENT__;
 }
+QComboBox {
+    min-height: 34px;
+    padding: 0 10px;
+}
 QPushButton {
-    min-height: __COMPOSER_HEIGHT__px;
-    max-height: __COMPOSER_HEIGHT__px;
     border: 0;
     border-radius: 8px;
     background: __ACCENT__;
