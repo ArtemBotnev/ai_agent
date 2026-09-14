@@ -5,17 +5,26 @@ from typing import Any, Callable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from application.agent_error import AgentError, AgentErrorCode
-from application.conversation_summarizer import ConversationSummarizer
-from application.llm_agent import LlmAnswer
-from application.sticky_facts_extractor import StickyFactsExtractor
+from application.chat.agent_error import AgentError, AgentErrorCode
+from application.facts.sticky_facts_extractor import StickyFactsExtractor
+from application.llm.llm_agent import LlmAnswer
+from application.memory.long_term_memory_extractor import LongTermMemoryExtractor
+from application.memory.working_memory_extractor import WorkingMemoryExtractor
+from application.summary.conversation_summarizer import ConversationSummarizer
+from domain.long_term_memory import LONG_TERM_MEMORY_SECTIONS, LongTermMemory
 from domain.message import USER_ROLE, Message
 from domain.sticky_facts import StickyFacts
+from domain.working_memory import WorkingMemory
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_MODEL_ENV = "OPENAI_MODEL"
-# DEFAULT_OPENAI_MODEL = "gpt-5"
 DEFAULT_OPENAI_MODEL = "gpt-3.5-turbo-0125"
+AVAILABLE_OPENAI_MODELS = (
+    DEFAULT_OPENAI_MODEL,
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-5",
+)
 OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_RESPONSES_INPUT_TOKENS_API_URL = "https://api.openai.com/v1/responses/input_tokens"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and concisely."
@@ -31,6 +40,16 @@ STICKY_FACTS_SYSTEM_PROMPT = (
     "preferences, decisions, agreements, user profile, project details, and open tasks. "
     "Preserve useful existing facts unless the new messages contradict them. "
     "Remove obsolete facts."
+)
+WORKING_MEMORY_SYSTEM_PROMPT = (
+    "You update working memory for the agent's current task. "
+    "Keep only active task data: goal, constraints, inputs, plan, open questions, "
+    "files, commands, current status, and next steps. Remove stale task data."
+)
+LONG_TERM_MEMORY_SYSTEM_PROMPT = (
+    "You update long-term memory for a chat agent. "
+    "Save only durable information that should help future sessions. "
+    "Separate it into profile, decisions, and knowledge. Do not store transient chat text."
 )
 
 
@@ -305,3 +324,167 @@ class SimpleStickyFactsExtractor(StickyFactsExtractor):
             f"Current facts:\n{facts_json}\n\n"
             f"Recent messages:\n{messages_text}"
         )
+
+
+@dataclass
+class SimpleWorkingMemoryExtractor(WorkingMemoryExtractor):
+    agent: SimpleLlmAgent
+
+    def update(self, memory: WorkingMemory, messages: Sequence[Message]) -> WorkingMemory:
+        if not messages:
+            return memory
+
+        prompt = self._build_prompt(memory, messages)
+        answer = self.agent.ask([Message(role=USER_ROLE, content=prompt)])
+        raw_items = _parse_json_items(answer.text)
+        if raw_items is None:
+            return memory
+
+        return WorkingMemory(_merge_string_items(memory.items, raw_items))
+
+    def _build_prompt(self, memory: WorkingMemory, messages: Sequence[Message]) -> str:
+        memory_json = json.dumps(memory.items, ensure_ascii=False, indent=2)
+        messages_text = _format_messages_for_memory(messages)
+
+        return (
+            "Update working memory for the current task.\n"
+            "Return only one JSON object with an items object. Keys must be strings. "
+            "Values must be strings, empty strings, or null.\n"
+            "Save only short-lived task state: current_goal, requirements, constraints, "
+            "selected_approach, files, commands, status, open_questions, next_steps.\n"
+            "Do not save user profile, durable decisions, or general knowledge here.\n"
+            "Use null or an empty string to delete stale task data.\n\n"
+            f"Current working memory:\n{memory_json}\n\n"
+            f"Recent messages:\n{messages_text}"
+        )
+
+
+@dataclass
+class SimpleLongTermMemoryExtractor(LongTermMemoryExtractor):
+    agent: SimpleLlmAgent
+
+    def update(self, memory: LongTermMemory, messages: Sequence[Message]) -> LongTermMemory:
+        if not messages:
+            return memory
+
+        prompt = self._build_prompt(memory, messages)
+        answer = self.agent.ask([Message(role=USER_ROLE, content=prompt)])
+        raw_sections = _parse_json_object(answer.text)
+        if raw_sections is None:
+            return memory
+
+        return self._merge_memory(memory, raw_sections)
+
+    def _merge_memory(
+        self,
+        memory: LongTermMemory,
+        raw_sections: dict[str, object],
+    ) -> LongTermMemory:
+        current_sections = {
+            "profile": dict(memory.profile),
+            "decisions": dict(memory.decisions),
+            "knowledge": dict(memory.knowledge),
+        }
+
+        for section_name in LONG_TERM_MEMORY_SECTIONS:
+            raw_updates = raw_sections.get(section_name)
+            if not isinstance(raw_updates, dict):
+                continue
+
+            current_sections[section_name] = _merge_string_items(
+                current_sections[section_name],
+                raw_updates,
+            )
+
+        return LongTermMemory(
+            profile=current_sections["profile"],
+            decisions=current_sections["decisions"],
+            knowledge=current_sections["knowledge"],
+        )
+
+    def _build_prompt(self, memory: LongTermMemory, messages: Sequence[Message]) -> str:
+        memory_json = json.dumps(memory.to_dict(), ensure_ascii=False, indent=2)
+        messages_text = _format_messages_for_memory(messages)
+
+        return (
+            "Update long-term memory.\n"
+            "Return only one JSON object with exactly these top-level objects: "
+            "profile, decisions, knowledge. Keys must be strings. Values must be "
+            "strings, empty strings, or null.\n"
+            "profile stores stable user/project profile details and preferences.\n"
+            "decisions stores durable decisions and agreements.\n"
+            "knowledge stores reusable domain or project knowledge.\n"
+            "Do not save current-task status, temporary plans, or raw chat history here.\n"
+            "Use null or an empty string to delete obsolete entries.\n\n"
+            f"Current long-term memory:\n{memory_json}\n\n"
+            f"Recent messages:\n{messages_text}"
+        )
+
+
+def _format_messages_for_memory(messages: Sequence[Message]) -> str:
+    return "\n".join(
+        f"{index}. {message.role}: {message.content}"
+        for index, message in enumerate(messages, start=1)
+    )
+
+
+def _parse_json_items(text: str) -> dict[str, object] | None:
+    parsed = _parse_json_object(text)
+    if parsed is None:
+        return None
+
+    raw_items = parsed.get("items")
+    if isinstance(raw_items, dict):
+        return raw_items
+
+    return parsed
+
+
+def _parse_json_object(text: str) -> dict[str, object] | None:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start_index = text.find("{")
+        end_index = text.rfind("}")
+        if start_index < 0 or end_index <= start_index:
+            return None
+
+        try:
+            parsed = json.loads(text[start_index : end_index + 1])
+        except json.JSONDecodeError:
+            return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    return parsed
+
+
+def _merge_string_items(
+    current_items: dict[str, str],
+    raw_updates: dict[str, object],
+) -> dict[str, str]:
+    updated_items = dict(current_items)
+
+    for key, value in raw_updates.items():
+        if not isinstance(key, str):
+            continue
+
+        clean_key = key.strip()
+        if not clean_key:
+            continue
+
+        if value is None:
+            updated_items.pop(clean_key, None)
+            continue
+
+        if not isinstance(value, str):
+            continue
+
+        clean_value = value.strip()
+        if clean_value:
+            updated_items[clean_key] = clean_value
+        else:
+            updated_items.pop(clean_key, None)
+
+    return updated_items

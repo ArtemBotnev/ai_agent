@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from application.message_history_repository import MessageHistoryRepository
+from application.chat.message_history_repository import MessageHistoryRepository
 from domain.message import Message
 
 

@@ -1,17 +1,25 @@
-import os
 import sys
 from typing import Any
 
-from agent import DEFAULT_OPENAI_MODEL, OPENAI_MODEL_ENV
-from application.agent_error import AgentError
-from application.chat_service import ChatResponse
-from application.context_strategy import ContextStrategy
+from application.chat.agent_error import AgentError
+from application.chat.chat_service import ChatResponse
+from application.chat.context_strategy import ContextStrategy
 from domain.conversation_branch import ConversationBranch, ConversationBranches
 from domain.conversation_summary import ConversationSummary
+from domain.long_term_memory import LongTermMemory
 from domain.message import Message
 from domain.sticky_facts import StickyFacts
+from domain.working_memory import WorkingMemory
 from main import build_chat_service, build_history_repository, format_agent_error, get_context_strategy
-from main import build_branch_repository, build_facts_repository, build_summary_repository
+from main import (
+    build_branch_repository,
+    build_facts_repository,
+    get_available_model_names,
+    get_model_name,
+    build_long_term_memory_repository,
+    build_summary_repository,
+    build_working_memory_repository,
+)
 from ui.message_html import AGENT_AUTHOR, ERROR_AUTHOR, USER_AUTHOR, render_message_html
 from ui.pyqt_theme import COMPOSER_HEIGHT, WINDOW_STYLESHEET
 
@@ -55,14 +63,23 @@ def main() -> None:
         answered = pyqtSignal(object)
         failed = pyqtSignal(str)
 
-        def __init__(self, message: str, context_strategy: ContextStrategy) -> None:
+        def __init__(
+            self,
+            message: str,
+            context_strategy: ContextStrategy,
+            model_name: str,
+        ) -> None:
             super().__init__()
             self._message = message
             self._context_strategy = context_strategy
+            self._model_name = model_name
 
         def run(self) -> None:
             try:
-                response = build_chat_service(self._context_strategy).answer(self._message)
+                response = build_chat_service(
+                    self._context_strategy,
+                    self._model_name,
+                ).answer(self._message)
             except RuntimeError as error:
                 self.failed.emit(str(error))
             except AgentError as error:
@@ -79,7 +96,7 @@ def main() -> None:
             self.setWindowTitle("LLM Агент")
             self.resize(920, 720)
 
-            self._model_label = QLabel(f"Модель: {os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL)}")
+            self._model_combo = QComboBox()
             self._status_label = QLabel("Готов")
             self._strategy_combo = QComboBox()
             self._branch_combo = QComboBox()
@@ -109,6 +126,12 @@ def main() -> None:
             if strategy_index >= 0:
                 self._strategy_combo.setCurrentIndex(strategy_index)
 
+            for model_name in get_available_model_names():
+                self._model_combo.addItem(model_name, model_name)
+            model_index = self._model_combo.findData(get_model_name())
+            if model_index >= 0:
+                self._model_combo.setCurrentIndex(model_index)
+
             self._input.submit_requested.connect(self._send_message)
             self._send_button.clicked.connect(self._send_message)
             self._clear_button.clicked.connect(self._clear_context)
@@ -118,7 +141,8 @@ def main() -> None:
             self._new_branch_button.clicked.connect(self._create_branch)
 
             header_layout = QHBoxLayout()
-            header_layout.addWidget(self._model_label)
+            header_layout.addWidget(QLabel("Модель:"))
+            header_layout.addWidget(self._model_combo)
             header_layout.addSpacing(16)
             header_layout.addWidget(QLabel("Стратегия:"))
             header_layout.addWidget(self._strategy_combo)
@@ -169,7 +193,11 @@ def main() -> None:
             self._input.clear()
             self._set_loading(True)
 
-            self._worker = ChatWorker(text, self._selected_strategy())
+            self._worker = ChatWorker(
+                text,
+                self._selected_strategy(),
+                self._selected_model_name(),
+            )
             self._worker.answered.connect(self._handle_answer)
             self._worker.failed.connect(self._handle_error)
             self._worker.finished.connect(lambda: self._set_loading(False))
@@ -194,6 +222,7 @@ def main() -> None:
         def _set_loading(self, is_loading: bool) -> None:
             self._send_button.setDisabled(is_loading)
             self._input.setDisabled(is_loading)
+            self._model_combo.setDisabled(is_loading)
             self._strategy_combo.setDisabled(is_loading)
             self._branch_combo.setDisabled(is_loading)
             self._checkpoint_button.setDisabled(is_loading)
@@ -217,12 +246,19 @@ def main() -> None:
         def _selected_strategy(self) -> ContextStrategy:
             strategy_value = self._strategy_combo.currentData()
             if not isinstance(strategy_value, str):
-                return ContextStrategy.SUMMARY
+                return ContextStrategy.MEMORY
+
+        def _selected_model_name(self) -> str:
+            model_name = self._model_combo.currentData()
+            if isinstance(model_name, str):
+                return model_name
+
+            return get_model_name()
 
             try:
                 return ContextStrategy.from_value(strategy_value)
             except ValueError:
-                return ContextStrategy.SUMMARY
+                return ContextStrategy.MEMORY
 
         def _load_messages_for_current_strategy(self) -> list[Message]:
             if self._selected_strategy() == ContextStrategy.BRANCHING:
@@ -325,6 +361,10 @@ def main() -> None:
             elif strategy == ContextStrategy.BRANCHING:
                 build_branch_repository().save(ConversationBranches.empty())
                 self._refresh_branch_combo()
+            elif strategy == ContextStrategy.MEMORY:
+                build_history_repository().save([])
+                build_working_memory_repository().save(WorkingMemory())
+                build_long_term_memory_repository().save(LongTermMemory())
             else:
                 build_history_repository().save([])
 

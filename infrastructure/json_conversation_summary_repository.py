@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from application.conversation_summary_repository import ConversationSummaryRepository
+from application.summary.conversation_summary_repository import ConversationSummaryRepository
 from domain.conversation_summary import ConversationSummary
 
 

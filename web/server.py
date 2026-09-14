@@ -8,9 +8,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from agent import DEFAULT_OPENAI_MODEL, OPENAI_MODEL_ENV
-from application.agent_error import AgentError, AgentErrorCode
-from main import AGENT_ERROR_MESSAGES, build_chat_service, build_history_repository, format_agent_error
+from application.chat.agent_error import AgentError, AgentErrorCode
+from main import (
+    AGENT_ERROR_MESSAGES,
+    build_chat_service,
+    build_history_repository,
+    format_agent_error,
+    get_available_model_names,
+    get_model_name,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -35,7 +41,14 @@ class WebChatHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/config":
-            self._send_json({"model": get_model_name()}, HTTPStatus.OK, include_body=include_body)
+            self._send_json(
+                {
+                    "model": get_model_name(),
+                    "models": get_available_model_names(),
+                },
+                HTTPStatus.OK,
+                include_body=include_body,
+            )
             return
 
         if path == "/api/messages":
@@ -66,8 +79,15 @@ class WebChatHandler(BaseHTTPRequestHandler):
             )
             return
 
+        model_name = payload.get("model")
         try:
-            chat_service = build_chat_service()
+            selected_model_name = get_model_name(model_name if isinstance(model_name, str) else None)
+        except RuntimeError as error:
+            self._send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        try:
+            chat_service = build_chat_service(model_name=selected_model_name)
             response = chat_service.answer(message)
         except RuntimeError as error:
             self._send_json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -79,6 +99,7 @@ class WebChatHandler(BaseHTTPRequestHandler):
         self._send_json(
             {
                 "answer": response.text,
+                "model": selected_model_name,
                 "tokens": {
                     "current_request": response.tokens.current_request,
                     "history": response.tokens.history,
@@ -151,11 +172,6 @@ class WebChatHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if include_body:
             self.wfile.write(body)
-
-
-def get_model_name() -> str:
-    return os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL)
-
 
 def get_server_address() -> tuple[str, int]:
     host = os.getenv(WEB_HOST_ENV, DEFAULT_HOST)

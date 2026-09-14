@@ -1,21 +1,28 @@
 from dataclasses import dataclass
 
-from application.agent_error import AgentError, AgentErrorCode
-from application.branch_repository import BranchRepository
-from application.conversation_summarizer import ConversationSummarizer
-from application.conversation_summary_repository import ConversationSummaryRepository
-from application.context_strategy import ContextStrategy
-from application.llm_agent import LlmAgent
-from application.message_history_repository import MessageHistoryRepository
-from application.sticky_facts_extractor import StickyFactsExtractor
-from application.sticky_facts_repository import StickyFactsRepository
+from application.branches.branch_repository import BranchRepository
+from application.chat.agent_error import AgentError, AgentErrorCode
+from application.chat.context_strategy import ContextStrategy
+from application.chat.message_history_repository import MessageHistoryRepository
+from application.facts.sticky_facts_extractor import StickyFactsExtractor
+from application.facts.sticky_facts_repository import StickyFactsRepository
+from application.llm.llm_agent import LlmAgent
+from application.memory.long_term_memory_extractor import LongTermMemoryExtractor
+from application.memory.long_term_memory_repository import LongTermMemoryRepository
+from application.memory.working_memory_extractor import WorkingMemoryExtractor
+from application.memory.working_memory_repository import WorkingMemoryRepository
+from application.summary.conversation_summarizer import ConversationSummarizer
+from application.summary.conversation_summary_repository import ConversationSummaryRepository
+from domain.agent_memory import AgentMemorySnapshot
 from domain.conversation_branch import (
     ConversationBranch,
     ConversationBranches,
 )
 from domain.conversation_summary import ConversationSummary
+from domain.long_term_memory import LongTermMemory
 from domain.message import ASSISTANT_ROLE, USER_ROLE, Message
 from domain.sticky_facts import StickyFacts
+from domain.working_memory import WorkingMemory
 
 DEFAULT_RECENT_MESSAGES_LIMIT = 6
 
@@ -43,8 +50,12 @@ class ChatService:
         facts_repository: StickyFactsRepository,
         facts_extractor: StickyFactsExtractor,
         branch_repository: BranchRepository,
+        working_memory_repository: WorkingMemoryRepository | None = None,
+        working_memory_extractor: WorkingMemoryExtractor | None = None,
+        long_term_memory_repository: LongTermMemoryRepository | None = None,
+        long_term_memory_extractor: LongTermMemoryExtractor | None = None,
         recent_messages_limit: int = DEFAULT_RECENT_MESSAGES_LIMIT,
-        context_strategy: ContextStrategy = ContextStrategy.SUMMARY,
+        context_strategy: ContextStrategy = ContextStrategy.MEMORY,
     ) -> None:
         self._agent = agent
         self._history_repository = history_repository
@@ -53,6 +64,10 @@ class ChatService:
         self._facts_repository = facts_repository
         self._facts_extractor = facts_extractor
         self._branch_repository = branch_repository
+        self._working_memory_repository = working_memory_repository
+        self._working_memory_extractor = working_memory_extractor
+        self._long_term_memory_repository = long_term_memory_repository
+        self._long_term_memory_extractor = long_term_memory_extractor
         self._recent_messages_limit = recent_messages_limit
         self._context_strategy = context_strategy
         if self._recent_messages_limit < 1:
@@ -73,10 +88,20 @@ class ChatService:
         if self._context_strategy == ContextStrategy.BRANCHING:
             return self._answer_with_branching(current_message)
 
+        if self._context_strategy == ContextStrategy.MEMORY:
+            return self._answer_with_memory(current_message)
+
         return self._answer_with_summary(current_message)
 
     def get_context_strategy(self) -> ContextStrategy:
         return self._context_strategy
+
+    def get_model_name(self) -> str:
+        model_name = getattr(self._agent, "model", "")
+        if isinstance(model_name, str):
+            return model_name
+
+        return ""
 
     def set_context_strategy(self, context_strategy: ContextStrategy) -> None:
         self._context_strategy = context_strategy
@@ -100,6 +125,13 @@ class ChatService:
 
         if self._context_strategy == ContextStrategy.BRANCHING:
             self._branch_repository.save(ConversationBranches.empty())
+            return
+
+        if self._context_strategy == ContextStrategy.MEMORY:
+            self._require_memory_components()
+            self._save_short_term_memory([])
+            self._save_working_memory(WorkingMemory())
+            self._save_long_term_memory(LongTermMemory())
             return
 
         self._history_repository.save([])
@@ -262,6 +294,100 @@ class ChatService:
                 history=history_tokens,
                 response=answer.response_tokens,
             ),
+        )
+
+    def _answer_with_memory(self, current_message: Message) -> ChatResponse:
+        (
+            working_memory_repository,
+            working_memory_extractor,
+            long_term_memory_repository,
+            long_term_memory_extractor,
+        ) = self._require_memory_components()
+
+        short_term_messages = self._load_short_term_memory()
+        working_memory = working_memory_repository.load()
+        long_term_memory = long_term_memory_repository.load()
+
+        short_term_messages.append(current_message)
+        short_term_messages = short_term_messages[-self._recent_messages_limit :]
+        memory_snapshot = AgentMemorySnapshot(
+            short_term=short_term_messages,
+            working=working_memory,
+            long_term=long_term_memory,
+        )
+        context = memory_snapshot.to_context()
+
+        current_request_tokens = self._agent.count_tokens([current_message])
+        history_tokens = self._agent.count_tokens(short_term_messages, context=context)
+        answer = self._agent.ask(short_term_messages, context=context)
+
+        assistant_message = Message(role=ASSISTANT_ROLE, content=answer.text)
+        completed_turn_messages = [current_message, assistant_message]
+        short_term_messages.append(assistant_message)
+        short_term_messages = short_term_messages[-self._recent_messages_limit :]
+
+        working_memory = working_memory_extractor.update(
+            working_memory,
+            completed_turn_messages,
+        )
+        long_term_memory = long_term_memory_extractor.update(
+            long_term_memory,
+            completed_turn_messages,
+        )
+
+        self._save_short_term_memory(short_term_messages)
+        self._save_working_memory(working_memory)
+        self._save_long_term_memory(long_term_memory)
+
+        return ChatResponse(
+            text=answer.text,
+            tokens=ChatTokenUsage(
+                current_request=current_request_tokens,
+                history=history_tokens,
+                response=answer.response_tokens,
+            ),
+        )
+
+    def _load_short_term_memory(self) -> list[Message]:
+        return self._history_repository.load()
+
+    def _save_short_term_memory(self, messages: list[Message]) -> None:
+        self._history_repository.save(messages)
+
+    def _save_working_memory(self, memory: WorkingMemory) -> None:
+        working_memory_repository, *_ = self._require_memory_components()
+        working_memory_repository.save(memory)
+
+    def _save_long_term_memory(self, memory: LongTermMemory) -> None:
+        (
+            _working_memory_repository,
+            _working_memory_extractor,
+            long_term_memory_repository,
+            _long_term_memory_extractor,
+        ) = self._require_memory_components()
+        long_term_memory_repository.save(memory)
+
+    def _require_memory_components(
+        self,
+    ) -> tuple[
+        WorkingMemoryRepository,
+        WorkingMemoryExtractor,
+        LongTermMemoryRepository,
+        LongTermMemoryExtractor,
+    ]:
+        if (
+            self._working_memory_repository is None
+            or self._working_memory_extractor is None
+            or self._long_term_memory_repository is None
+            or self._long_term_memory_extractor is None
+        ):
+            raise RuntimeError("Memory strategy requires working and long-term memory components.")
+
+        return (
+            self._working_memory_repository,
+            self._working_memory_extractor,
+            self._long_term_memory_repository,
+            self._long_term_memory_extractor,
         )
 
     def _compact_history(

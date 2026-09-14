@@ -6,6 +6,7 @@ class ContextStrategy(Enum):
     SUMMARY = "summary"
     STICKY_FACTS = "sticky_facts"
     BRANCHING = "branching"
+    MEMORY = "memory"
 
     @property
     def display_name(self) -> str:
@@ -14,6 +15,7 @@ class ContextStrategy(Enum):
             ContextStrategy.SUMMARY: "Summary",
             ContextStrategy.STICKY_FACTS: "Sticky Facts",
             ContextStrategy.BRANCHING: "Branching",
+            ContextStrategy.MEMORY: "Memory",
         }[self]
 
     @classmethod

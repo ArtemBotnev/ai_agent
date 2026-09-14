@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from application.branch_repository import BranchRepository
+from application.branches.branch_repository import BranchRepository
 from domain.conversation_branch import ConversationBranches
 
 
