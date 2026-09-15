@@ -26,6 +26,7 @@ from application.facts.sticky_facts_extractor import StickyFactsExtractor
 from application.facts.sticky_facts_repository import StickyFactsRepository
 from application.memory.long_term_memory_extractor import LongTermMemoryExtractor
 from application.memory.long_term_memory_repository import LongTermMemoryRepository
+from application.memory.user_profile_repository import UserProfileRepository
 from application.memory.working_memory_extractor import WorkingMemoryExtractor
 from application.memory.working_memory_repository import WorkingMemoryRepository
 from application.summary.conversation_summarizer import ConversationSummarizer
@@ -36,18 +37,21 @@ from infrastructure.json_long_term_memory_repository import JsonLongTermMemoryRe
 from infrastructure.json_message_history_repository import JsonMessageHistoryRepository
 from infrastructure.json_sticky_facts_repository import JsonStickyFactsRepository
 from infrastructure.json_working_memory_repository import JsonWorkingMemoryRepository
+from infrastructure.markdown_user_profile_repository import MarkdownUserProfileRepository
 
 DEFAULT_SUMMARY_FILE = Path("history/summary.json")
 DEFAULT_FACTS_FILE = Path("history/facts.json")
 DEFAULT_BRANCHES_FILE = Path("history/branches.json")
 DEFAULT_USER_ID = "1"
 DEFAULT_MEMORY_DIR = Path("memory/users")
+DEFAULT_PROFILES_DIR = Path("profiles/users")
 AGENT_HISTORY_FILE_ENV = "AGENT_HISTORY_FILE"
 AGENT_SUMMARY_FILE_ENV = "AGENT_SUMMARY_FILE"
 AGENT_FACTS_FILE_ENV = "AGENT_FACTS_FILE"
 AGENT_BRANCHES_FILE_ENV = "AGENT_BRANCHES_FILE"
 AGENT_WORKING_MEMORY_FILE_ENV = "AGENT_WORKING_MEMORY_FILE"
 AGENT_LONG_TERM_MEMORY_FILE_ENV = "AGENT_LONG_TERM_MEMORY_FILE"
+AGENT_USER_PROFILE_FILE_ENV = "AGENT_USER_PROFILE_FILE"
 AGENT_USER_ID_ENV = "AGENT_USER_ID"
 AGENT_RECENT_MESSAGES_LIMIT_ENV = "AGENT_RECENT_MESSAGES_LIMIT"
 AGENT_CONTEXT_STRATEGY_ENV = "AGENT_CONTEXT_STRATEGY"
@@ -129,11 +133,11 @@ def get_model_name(model_name: str | None = None) -> str:
     return selected_model
 
 
-def build_history_repository() -> MessageHistoryRepository:
+def build_history_repository(user_id: str | None = None) -> MessageHistoryRepository:
     history_file = Path(
         os.getenv(
             AGENT_HISTORY_FILE_ENV,
-            str(build_user_memory_file("messages.json")),
+            str(build_user_memory_file("messages.json", user_id)),
         )
     )
     return JsonMessageHistoryRepository(history_file)
@@ -154,8 +158,9 @@ def build_branch_repository() -> BranchRepository:
     return JsonBranchRepository(branches_file)
 
 
-def get_user_id() -> str:
-    user_id = os.getenv(AGENT_USER_ID_ENV, DEFAULT_USER_ID).strip()
+def get_user_id(user_id: str | None = None) -> str:
+    selected_user_id = user_id if user_id is not None else os.getenv(AGENT_USER_ID_ENV, DEFAULT_USER_ID)
+    user_id = selected_user_id.strip()
     if not user_id:
         raise RuntimeError(f"Переменная {AGENT_USER_ID_ENV} не должна быть пустой.")
 
@@ -167,25 +172,57 @@ def get_user_id() -> str:
     return user_id
 
 
-def build_user_memory_file(file_name: str) -> Path:
-    return DEFAULT_MEMORY_DIR / get_user_id() / file_name
+def get_available_user_ids() -> list[str]:
+    user_ids = {get_user_id()}
+    for users_dir in (DEFAULT_MEMORY_DIR, DEFAULT_PROFILES_DIR):
+        if not users_dir.exists():
+            continue
+
+        for user_dir in users_dir.iterdir():
+            if not user_dir.is_dir():
+                continue
+
+            try:
+                user_ids.add(get_user_id(user_dir.name))
+            except RuntimeError:
+                continue
+
+    return sorted(user_ids)
 
 
-def build_working_memory_repository() -> WorkingMemoryRepository:
+def build_user_memory_file(file_name: str, user_id: str | None = None) -> Path:
+    return DEFAULT_MEMORY_DIR / get_user_id(user_id) / file_name
+
+
+def build_user_profile_file(user_id: str | None = None) -> Path:
+    return DEFAULT_PROFILES_DIR / get_user_id(user_id) / "profile.md"
+
+
+def build_user_profile_repository(user_id: str | None = None) -> UserProfileRepository:
+    profile_file = Path(
+        os.getenv(
+            AGENT_USER_PROFILE_FILE_ENV,
+            str(build_user_profile_file(user_id)),
+        )
+    )
+    return MarkdownUserProfileRepository(profile_file)
+
+
+def build_working_memory_repository(user_id: str | None = None) -> WorkingMemoryRepository:
     memory_file = Path(
         os.getenv(
             AGENT_WORKING_MEMORY_FILE_ENV,
-            str(build_user_memory_file("working_memory.json")),
+            str(build_user_memory_file("working_memory.json", user_id)),
         )
     )
     return JsonWorkingMemoryRepository(memory_file)
 
 
-def build_long_term_memory_repository() -> LongTermMemoryRepository:
+def build_long_term_memory_repository(user_id: str | None = None) -> LongTermMemoryRepository:
     memory_file = Path(
         os.getenv(
             AGENT_LONG_TERM_MEMORY_FILE_ENV,
-            str(build_user_memory_file("long_term_memory.json")),
+            str(build_user_memory_file("long_term_memory.json", user_id)),
         )
     )
     return JsonLongTermMemoryRepository(memory_file)
@@ -219,20 +256,23 @@ def get_context_strategy() -> ContextStrategy:
 def build_chat_service(
     context_strategy: ContextStrategy | None = None,
     model_name: str | None = None,
+    user_id: str | None = None,
 ) -> ChatService:
     selected_model_name = get_model_name(model_name)
+    selected_user_id = get_user_id(user_id)
     return ChatService(
         agent=build_agent(selected_model_name),
-        history_repository=build_history_repository(),
+        history_repository=build_history_repository(selected_user_id),
         summary_repository=build_summary_repository(),
         summarizer=build_summarizer(selected_model_name),
         facts_repository=build_facts_repository(),
         facts_extractor=build_facts_extractor(selected_model_name),
         branch_repository=build_branch_repository(),
-        working_memory_repository=build_working_memory_repository(),
+        working_memory_repository=build_working_memory_repository(selected_user_id),
         working_memory_extractor=build_working_memory_extractor(selected_model_name),
-        long_term_memory_repository=build_long_term_memory_repository(),
+        long_term_memory_repository=build_long_term_memory_repository(selected_user_id),
         long_term_memory_extractor=build_long_term_memory_extractor(selected_model_name),
+        user_profile_repository=build_user_profile_repository(selected_user_id),
         recent_messages_limit=get_recent_messages_limit(),
         context_strategy=context_strategy or get_context_strategy(),
     )

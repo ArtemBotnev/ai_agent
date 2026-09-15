@@ -15,7 +15,9 @@ from main import (
     build_branch_repository,
     build_facts_repository,
     get_available_model_names,
+    get_available_user_ids,
     get_model_name,
+    get_user_id,
     build_long_term_memory_repository,
     build_summary_repository,
     build_working_memory_repository,
@@ -68,17 +70,20 @@ def main() -> None:
             message: str,
             context_strategy: ContextStrategy,
             model_name: str,
+            user_id: str,
         ) -> None:
             super().__init__()
             self._message = message
             self._context_strategy = context_strategy
             self._model_name = model_name
+            self._user_id = user_id
 
         def run(self) -> None:
             try:
                 response = build_chat_service(
                     self._context_strategy,
                     self._model_name,
+                    self._user_id,
                 ).answer(self._message)
             except RuntimeError as error:
                 self.failed.emit(str(error))
@@ -96,6 +101,8 @@ def main() -> None:
             self.setWindowTitle("LLM Агент")
             self.resize(920, 720)
 
+            self._user_label = QLabel("Пользователь:")
+            self._user_combo = QComboBox()
             self._model_combo = QComboBox()
             self._status_label = QLabel("Готов")
             self._strategy_combo = QComboBox()
@@ -120,6 +127,16 @@ def main() -> None:
             self._checkpoint_button.setFixedHeight(36)
             self._new_branch_button.setFixedHeight(36)
 
+            user_ids = get_available_user_ids()
+            for user_id in user_ids:
+                self._user_combo.addItem(user_id, user_id)
+            user_index = self._user_combo.findData(get_user_id())
+            if user_index >= 0:
+                self._user_combo.setCurrentIndex(user_index)
+            show_user_selector = len(user_ids) > 1
+            self._user_label.setVisible(show_user_selector)
+            self._user_combo.setVisible(show_user_selector)
+
             for strategy in ContextStrategy:
                 self._strategy_combo.addItem(strategy.display_name, strategy.value)
             strategy_index = self._strategy_combo.findData(get_context_strategy().value)
@@ -135,12 +152,17 @@ def main() -> None:
             self._input.submit_requested.connect(self._send_message)
             self._send_button.clicked.connect(self._send_message)
             self._clear_button.clicked.connect(self._clear_context)
+            self._user_combo.currentIndexChanged.connect(self._handle_user_changed)
             self._strategy_combo.currentIndexChanged.connect(self._handle_strategy_changed)
             self._branch_combo.currentIndexChanged.connect(self._handle_branch_changed)
             self._checkpoint_button.clicked.connect(self._save_checkpoint)
             self._new_branch_button.clicked.connect(self._create_branch)
 
             header_layout = QHBoxLayout()
+            if show_user_selector:
+                header_layout.addWidget(self._user_label)
+                header_layout.addWidget(self._user_combo)
+                header_layout.addSpacing(16)
             header_layout.addWidget(QLabel("Модель:"))
             header_layout.addWidget(self._model_combo)
             header_layout.addSpacing(16)
@@ -197,6 +219,7 @@ def main() -> None:
                 text,
                 self._selected_strategy(),
                 self._selected_model_name(),
+                self._selected_user_id(),
             )
             self._worker.answered.connect(self._handle_answer)
             self._worker.failed.connect(self._handle_error)
@@ -222,6 +245,7 @@ def main() -> None:
         def _set_loading(self, is_loading: bool) -> None:
             self._send_button.setDisabled(is_loading)
             self._input.setDisabled(is_loading)
+            self._user_combo.setDisabled(is_loading)
             self._model_combo.setDisabled(is_loading)
             self._strategy_combo.setDisabled(is_loading)
             self._branch_combo.setDisabled(is_loading)
@@ -248,6 +272,11 @@ def main() -> None:
             if not isinstance(strategy_value, str):
                 return ContextStrategy.MEMORY
 
+            try:
+                return ContextStrategy.from_value(strategy_value)
+            except ValueError:
+                return ContextStrategy.MEMORY
+
         def _selected_model_name(self) -> str:
             model_name = self._model_combo.currentData()
             if isinstance(model_name, str):
@@ -255,18 +284,24 @@ def main() -> None:
 
             return get_model_name()
 
-            try:
-                return ContextStrategy.from_value(strategy_value)
-            except ValueError:
-                return ContextStrategy.MEMORY
+        def _selected_user_id(self) -> str:
+            user_id = self._user_combo.currentData()
+            if isinstance(user_id, str):
+                return user_id
+
+            return get_user_id()
 
         def _load_messages_for_current_strategy(self) -> list[Message]:
             if self._selected_strategy() == ContextStrategy.BRANCHING:
                 return build_branch_repository().load().active_branch.messages
 
-            return build_history_repository().load()
+            return build_history_repository(self._selected_user_id()).load()
 
         def _handle_strategy_changed(self, *_args: Any) -> None:
+            self._update_branch_controls()
+            self._load_history()
+
+        def _handle_user_changed(self, *_args: Any) -> None:
             self._update_branch_controls()
             self._load_history()
 
@@ -353,20 +388,20 @@ def main() -> None:
         def _clear_context(self) -> None:
             strategy = self._selected_strategy()
             if strategy == ContextStrategy.SUMMARY:
-                build_history_repository().save([])
+                build_history_repository(self._selected_user_id()).save([])
                 build_summary_repository().save(ConversationSummary())
             elif strategy == ContextStrategy.STICKY_FACTS:
-                build_history_repository().save([])
+                build_history_repository(self._selected_user_id()).save([])
                 build_facts_repository().save(StickyFacts())
             elif strategy == ContextStrategy.BRANCHING:
                 build_branch_repository().save(ConversationBranches.empty())
                 self._refresh_branch_combo()
             elif strategy == ContextStrategy.MEMORY:
-                build_history_repository().save([])
-                build_working_memory_repository().save(WorkingMemory())
-                build_long_term_memory_repository().save(LongTermMemory())
+                build_history_repository(self._selected_user_id()).save([])
+                build_working_memory_repository(self._selected_user_id()).save(WorkingMemory())
+                build_long_term_memory_repository(self._selected_user_id()).save(LongTermMemory())
             else:
-                build_history_repository().save([])
+                build_history_repository(self._selected_user_id()).save([])
 
             self._load_history()
 
