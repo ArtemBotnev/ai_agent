@@ -2,6 +2,13 @@ from dataclasses import dataclass, field
 
 
 TASK_STATE_STAGES = ("planning", "execution", "validation", "done")
+TASK_STATE_STAGE_STEPS = {
+    "planning": 1,
+    "execution": 2,
+    "validation": 3,
+    "done": 4,
+}
+TASK_STATE_TOTAL_STEPS = len(TASK_STATE_STAGES)
 TASK_STATE_DESCRIPTIONS = {
     "planning": "сбор требований, уточнения и предложение плана без реализации",
     "execution": "выполнение согласованного решения и создание артефактов",
@@ -113,6 +120,8 @@ class TaskState:
     stage: str = "planning"
     step: int = 0
     total: int = 0
+    plan_step: int = 0
+    plan_total: int = 0
     plan: tuple[str, ...] = field(default_factory=tuple)
     done: tuple[str, ...] = field(default_factory=tuple)
     current: str = ""
@@ -124,6 +133,8 @@ class TaskState:
             "stage": self.stage,
             "step": self.step,
             "total": self.total,
+            "plan_step": self.plan_step,
+            "plan_total": self.plan_total,
             "plan": list(self.plan),
             "done": list(self.done),
             "current": self.current,
@@ -138,7 +149,8 @@ class TaskState:
             f"- stage_marker: {TASK_STATE_MARKERS[self.stage]}",
             f"- stage_meaning: {TASK_STATE_DESCRIPTIONS[self.stage]}",
             f"- stage_instruction: {TASK_STATE_INSTRUCTIONS[self.stage]}",
-            f"- step: {self.step}/{self.total}",
+            f"- workflow_step: {self.step}/{self.total}",
+            f"- plan_step: {self.plan_step}/{self.plan_total}",
             f"- current: {self.current or 'not set'}",
             f"- paused: {str(self.paused).lower()}",
             "- allowed_transitions: planning->execution; execution->validation|planning; "
@@ -165,7 +177,7 @@ class TaskState:
             proposed = proposed._copy(task=self.task or _sanitize_task(user_text))
 
         if self._is_new_task(proposed, user_text):
-            return proposed._copy(stage="planning", step=0, done=())._normalize()
+            return proposed._copy(stage="planning", done=())._normalize()
 
         adjusted_stage = self._adjust_stage(proposed.stage, user_text, assistant_text)
         proposed = proposed._copy(task=self.task or proposed.task, stage=adjusted_stage)
@@ -173,7 +185,6 @@ class TaskState:
             proposed_done = proposed.done if proposed.done else self.done
             proposed = proposed._copy(
                 plan=self.plan,
-                total=self.total,
                 done=proposed_done,
             )
 
@@ -196,6 +207,52 @@ class TaskState:
             return self._copy(stage="execution", paused=False)._normalize()
 
         return self
+
+    def apply_planning_result(
+        self,
+        *,
+        task: str,
+        plan: list[str],
+        current: str,
+        ready_for_execution: bool,
+    ) -> "TaskState":
+        updated = self._copy(
+            task=task or self.task,
+            stage="planning",
+            plan=tuple(plan),
+            done=(),
+            current=current,
+            paused=False,
+        )._normalize()
+        if ready_for_execution and updated._has_plan():
+            return updated._copy(stage="execution")._normalize()
+
+        return updated
+
+    def apply_execution_result(
+        self,
+        *,
+        needs_clarification: bool,
+        completed_steps: list[str],
+        current: str,
+    ) -> "TaskState":
+        stage = "planning" if needs_clarification else "validation"
+        done = tuple(dict.fromkeys((*self.done, *completed_steps)))
+        return self._copy(
+            stage=stage,
+            done=done,
+            current=current,
+            paused=False,
+        )._normalize()
+
+    def apply_validation_result(self, *, valid: bool, current: str = "") -> "TaskState":
+        done = self.plan if valid and self.plan else self.done
+        return self._copy(
+            stage="done" if valid else "execution",
+            done=done,
+            current=current,
+            paused=False,
+        )._normalize()
 
     @classmethod
     def start(cls, task: str) -> "TaskState":
@@ -221,6 +278,8 @@ class TaskState:
             stage=stage,
             step=_read_int(data.get("step")),
             total=_read_int(data.get("total")),
+            plan_step=_read_int(data.get("plan_step")),
+            plan_total=_read_int(data.get("plan_total")),
             plan=tuple(_read_string_list(data.get("plan"))),
             done=tuple(_read_string_list(data.get("done"))),
             current=current,
@@ -271,30 +330,35 @@ class TaskState:
         return _has_task_changed(self.task, proposed.task)
 
     def _has_plan(self) -> bool:
-        return bool(self.plan) and self.total > 0
+        return bool(self.plan) and self.plan_total > 0
 
     def _normalize(self) -> "TaskState":
         plan = tuple(_sanitize_item(item) for item in self.plan if _sanitize_item(item))
         done = tuple(_sanitize_item(item) for item in self.done if _sanitize_item(item))
         plan = tuple(dict.fromkeys(plan))[:12]
         done = tuple(dict.fromkeys(done))[:12]
-        total = len(plan) if plan else max(0, min(self.total, 12))
-        step = self.step
-        if total == 0:
-            step = 0
-        elif step <= 0:
-            step = 1
+        stage = self.stage if self.stage in TASK_STATE_STAGES else "planning"
+        total = TASK_STATE_TOTAL_STEPS
+        step = TASK_STATE_STAGE_STEPS[stage]
+        plan_total = len(plan)
+        if plan_total == 0:
+            plan_step = 0
+        elif stage == "done":
+            plan_step = plan_total
         else:
-            step = min(step, total)
+            plan_step = min(max(1, len(done) + 1), plan_total)
 
         current = _sanitize_item(self.current)
         if not current:
-            current = _default_current(self.stage, plan, step)
+            current = _default_current(stage, plan, plan_step)
 
         return self._copy(
             task=_sanitize_task(self.task),
+            stage=stage,
             step=step,
             total=total,
+            plan_step=plan_step,
+            plan_total=plan_total,
             plan=plan,
             done=done,
             current=current,
@@ -308,6 +372,8 @@ class TaskState:
             stage=data["stage"] if isinstance(data["stage"], str) else "planning",
             step=data["step"] if isinstance(data["step"], int) else 0,
             total=data["total"] if isinstance(data["total"], int) else 0,
+            plan_step=data["plan_step"] if isinstance(data.get("plan_step"), int) else 0,
+            plan_total=data["plan_total"] if isinstance(data.get("plan_total"), int) else 0,
             plan=tuple(data["plan"]) if isinstance(data["plan"], (list, tuple)) else (),
             done=tuple(data["done"]) if isinstance(data["done"], (list, tuple)) else (),
             current=data["current"] if isinstance(data["current"], str) else "",

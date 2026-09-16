@@ -9,13 +9,21 @@ from agent import (
     OPENAI_API_KEY_ENV,
     OPENAI_MODEL_ENV,
     LONG_TERM_MEMORY_SYSTEM_PROMPT,
+    DONE_AGENT_SYSTEM_PROMPT,
+    EXECUTION_AGENT_SYSTEM_PROMPT,
+    PLANNING_AGENT_SYSTEM_PROMPT,
     STICKY_FACTS_SYSTEM_PROMPT,
     SUMMARY_SYSTEM_PROMPT,
+    SimpleDoneAgent,
     SimpleConversationSummarizer,
+    SimpleExecutionAgent,
     SimpleLlmAgent,
     SimpleLongTermMemoryExtractor,
+    SimplePlanningAgent,
     SimpleStickyFactsExtractor,
+    SimpleValidationAgent,
     SimpleWorkingMemoryExtractor,
+    VALIDATION_AGENT_SYSTEM_PROMPT,
     WORKING_MEMORY_SYSTEM_PROMPT,
 )
 from application.branches.branch_repository import BranchRepository
@@ -32,6 +40,7 @@ from application.memory.working_memory_extractor import WorkingMemoryExtractor
 from application.memory.working_memory_repository import WorkingMemoryRepository
 from application.summary.conversation_summarizer import ConversationSummarizer
 from application.summary.conversation_summary_repository import ConversationSummaryRepository
+from application.workflow.task_stage_agents import DoneAgent, ExecutionAgent, PlanningAgent, ValidationAgent
 from domain.working_memory import WorkingMemory
 from infrastructure.json_branch_repository import JsonBranchRepository
 from infrastructure.json_conversation_summary_repository import JsonConversationSummaryRepository
@@ -109,6 +118,42 @@ def build_long_term_memory_extractor(model_name: str | None = None) -> LongTermM
         system_prompt=LONG_TERM_MEMORY_SYSTEM_PROMPT,
     )
     return SimpleLongTermMemoryExtractor(long_term_memory_agent)
+
+
+def build_planning_agent(model_name: str | None = None) -> PlanningAgent:
+    planning_agent = SimpleLlmAgent(
+        api_key=get_api_key(),
+        model=get_model_name(model_name),
+        system_prompt=PLANNING_AGENT_SYSTEM_PROMPT,
+    )
+    return SimplePlanningAgent(planning_agent)
+
+
+def build_execution_agent(model_name: str | None = None) -> ExecutionAgent:
+    execution_agent = SimpleLlmAgent(
+        api_key=get_api_key(),
+        model=get_model_name(model_name),
+        system_prompt=EXECUTION_AGENT_SYSTEM_PROMPT,
+    )
+    return SimpleExecutionAgent(execution_agent)
+
+
+def build_validation_agent(model_name: str | None = None) -> ValidationAgent:
+    validation_agent = SimpleLlmAgent(
+        api_key=get_api_key(),
+        model=get_model_name(model_name),
+        system_prompt=VALIDATION_AGENT_SYSTEM_PROMPT,
+    )
+    return SimpleValidationAgent(validation_agent)
+
+
+def build_done_agent(model_name: str | None = None) -> DoneAgent:
+    done_agent = SimpleLlmAgent(
+        api_key=get_api_key(),
+        model=get_model_name(model_name),
+        system_prompt=DONE_AGENT_SYSTEM_PROMPT,
+    )
+    return SimpleDoneAgent(done_agent)
 
 
 def get_api_key() -> str:
@@ -279,6 +324,10 @@ def build_chat_service(
         recent_messages_limit=get_recent_messages_limit(),
         context_strategy=context_strategy or get_context_strategy(),
         on_task_stage_changed=on_task_stage_changed,
+        planning_agent=build_planning_agent(selected_model_name),
+        execution_agent=build_execution_agent(selected_model_name),
+        validation_agent=build_validation_agent(selected_model_name),
+        done_agent=build_done_agent(selected_model_name),
     )
 
 

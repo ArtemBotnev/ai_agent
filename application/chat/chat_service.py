@@ -15,6 +15,13 @@ from application.memory.working_memory_extractor import WorkingMemoryExtractor
 from application.memory.working_memory_repository import WorkingMemoryRepository
 from application.summary.conversation_summarizer import ConversationSummarizer
 from application.summary.conversation_summary_repository import ConversationSummaryRepository
+from application.workflow.task_stage_agents import (
+    DoneAgent,
+    ExecutionAgent,
+    PlanningAgent,
+    TaskAgentContext,
+    ValidationAgent,
+)
 from domain.agent_memory import AgentMemorySnapshot
 from domain.conversation_branch import (
     ConversationBranch,
@@ -24,11 +31,10 @@ from domain.conversation_summary import ConversationSummary
 from domain.long_term_memory import LongTermMemory
 from domain.message import ASSISTANT_ROLE, USER_ROLE, Message
 from domain.sticky_facts import StickyFacts
-from domain.task_state import TASK_STATE_INSTRUCTIONS, TASK_STATE_MARKERS
 from domain.working_memory import WorkingMemory
 
 DEFAULT_RECENT_MESSAGES_LIMIT = 6
-MEMORY_STAGE_TURN_LIMIT = 4
+MEMORY_STAGE_TURN_LIMIT = 8
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,10 @@ class ChatService:
         recent_messages_limit: int = DEFAULT_RECENT_MESSAGES_LIMIT,
         context_strategy: ContextStrategy = ContextStrategy.MEMORY,
         on_task_stage_changed: Callable[[WorkingMemory], None] | None = None,
+        planning_agent: PlanningAgent | None = None,
+        execution_agent: ExecutionAgent | None = None,
+        validation_agent: ValidationAgent | None = None,
+        done_agent: DoneAgent | None = None,
     ) -> None:
         self._agent = agent
         self._history_repository = history_repository
@@ -78,6 +88,11 @@ class ChatService:
         self._recent_messages_limit = recent_messages_limit
         self._context_strategy = context_strategy
         self._on_task_stage_changed = on_task_stage_changed
+        self._planning_agent = planning_agent
+        self._execution_agent = execution_agent
+        self._validation_agent = validation_agent
+        self._done_agent = done_agent
+        self._last_notified_task_stage: str | None = None
         if self._recent_messages_limit < 1:
             raise ValueError("recent_messages_limit must be greater than 0.")
 
@@ -310,11 +325,12 @@ class ChatService:
     def _answer_with_memory(self, current_message: Message) -> ChatResponse:
         (
             working_memory_repository,
-            working_memory_extractor,
+            _working_memory_extractor,
             long_term_memory_repository,
             long_term_memory_extractor,
             user_profile_repository,
         ) = self._require_memory_components()
+        planning_agent, execution_agent, validation_agent, done_agent = self._require_task_stage_agents()
 
         short_term_messages = self._load_short_term_memory()
         saved_short_term_messages = list(short_term_messages)
@@ -333,9 +349,13 @@ class ChatService:
         current_request_tokens = self._agent.count_tokens([current_message])
         history_tokens = 0
         response_tokens = 0
-        visible_outputs: list[str] = []
+        final_answer = ""
         short_term_messages.append(current_message)
         short_term_messages = short_term_messages[-self._recent_messages_limit :]
+        artifact = working_memory.items.get("last_artifact", "")
+        validation_summary = working_memory.items.get("last_validation_summary", "")
+        revision_request = working_memory.items.get("revision_request", "")
+        validation_attempts = _read_int_item(working_memory.items, "validation_attempts")
 
         for _turn_index in range(MEMORY_STAGE_TURN_LIMIT):
             stage = working_memory.task_state.stage
@@ -345,41 +365,109 @@ class ChatService:
                 working=working_memory,
                 long_term=long_term_memory,
             )
-            context = self._build_memory_stage_context(memory_snapshot, stage)
-
-            history_tokens += self._agent.count_tokens(short_term_messages, context=context)
-            answer = self._agent.ask(short_term_messages, context=context)
-            response_tokens += answer.response_tokens
-
-            assistant_message = Message(role=ASSISTANT_ROLE, content=answer.text)
-            completed_turn_messages = [current_message, assistant_message]
-            visible_outputs.append(self._format_stage_output(stage, answer.text))
-            short_term_messages.append(assistant_message)
-            short_term_messages = short_term_messages[-self._recent_messages_limit :]
-
-            previous_stage = working_memory.task_state.stage
-            working_memory = working_memory_extractor.update(
-                working_memory,
-                completed_turn_messages,
+            task_context = TaskAgentContext(
+                user_message=current_message,
+                memory_snapshot=memory_snapshot,
             )
-            long_term_memory = long_term_memory_extractor.update(
-                long_term_memory,
-                completed_turn_messages,
-            )
-            next_stage = working_memory.task_state.stage
-            if next_stage != previous_stage:
-                self._notify_task_stage_changed(working_memory)
+            self._notify_task_stage_changed(working_memory)
 
-            if previous_stage == "planning":
+            if stage == "planning":
+                result = planning_agent.run(task_context)
+                history_tokens += result.usage.prompt_tokens
+                response_tokens += result.usage.response_tokens
+                previous_stage = working_memory.task_state.stage
+                working_memory = WorkingMemory(
+                    items={
+                        **working_memory.items,
+                        "revision_request": "",
+                        "validation_attempts": "0",
+                    },
+                    task_state=working_memory.task_state.apply_planning_result(
+                        task=result.task,
+                        plan=result.plan,
+                        current=result.current,
+                        ready_for_execution=result.ready_for_execution,
+                    ),
+                )
+                if working_memory.task_state.stage != previous_stage:
+                    self._notify_task_stage_changed(working_memory)
+                if not result.ready_for_execution:
+                    final_answer = result.reply
+                    break
+                short_term_messages.append(Message(role=ASSISTANT_ROLE, content=result.reply))
+                short_term_messages = short_term_messages[-self._recent_messages_limit :]
+                continue
+
+            if stage == "execution":
+                result = execution_agent.run(task_context, revision_request)
+                history_tokens += result.usage.prompt_tokens
+                response_tokens += result.usage.response_tokens
+                previous_stage = working_memory.task_state.stage
+                artifact = result.artifact or artifact
+                items = {
+                    **working_memory.items,
+                    "last_artifact": artifact,
+                    "revision_request": "",
+                }
+                working_memory = WorkingMemory(
+                    items=items,
+                    task_state=working_memory.task_state.apply_execution_result(
+                        needs_clarification=result.needs_clarification,
+                        completed_steps=result.completed_steps,
+                        current=result.current,
+                    ),
+                )
+                if working_memory.task_state.stage != previous_stage:
+                    self._notify_task_stage_changed(working_memory)
+                if result.needs_clarification:
+                    final_answer = result.reply or "Нужны уточнения перед выполнением."
+                    break
+                short_term_messages.append(Message(role=ASSISTANT_ROLE, content=result.reply or "Execution completed."))
+                short_term_messages = short_term_messages[-self._recent_messages_limit :]
+                continue
+
+            if stage == "validation":
+                result = validation_agent.run(task_context, artifact)
+                history_tokens += result.usage.prompt_tokens
+                response_tokens += result.usage.response_tokens
+                validation_summary = result.reply
+                previous_stage = working_memory.task_state.stage
+                if result.valid:
+                    revision_request = ""
+                    validation_attempts = 0
+                else:
+                    validation_attempts += 1
+                    revision_request = result.revision_request or "; ".join(result.issues)
+                working_memory = WorkingMemory(
+                    items={
+                        **working_memory.items,
+                        "last_artifact": artifact,
+                        "last_validation_summary": validation_summary,
+                        "revision_request": revision_request,
+                        "validation_attempts": str(validation_attempts),
+                    },
+                    task_state=working_memory.task_state.apply_validation_result(
+                        valid=result.valid,
+                        current="" if result.valid else revision_request,
+                    ),
+                )
+                if working_memory.task_state.stage != previous_stage:
+                    self._notify_task_stage_changed(working_memory)
+                if not result.valid and validation_attempts >= 2:
+                    final_answer = self._format_validation_failure(result.reply, result.issues)
+                    break
+                short_term_messages.append(Message(role=ASSISTANT_ROLE, content=result.reply))
+                short_term_messages = short_term_messages[-self._recent_messages_limit :]
+                continue
+
+            if stage == "done":
+                result = done_agent.run(task_context, artifact, validation_summary)
+                history_tokens += result.usage.prompt_tokens
+                response_tokens += result.usage.response_tokens
+                final_answer = self._format_done_answer(result.reply, artifact, validation_summary)
                 break
 
-            if next_stage in {"planning", "done"}:
-                break
-
-            if next_stage == previous_stage:
-                break
-
-        response_text = self._format_memory_response(visible_outputs, working_memory)
+        response_text = final_answer or "Workflow остановлен без итогового ответа."
         saved_short_term_messages.append(current_message)
         saved_short_term_messages.append(Message(role=ASSISTANT_ROLE, content=response_text))
         saved_short_term_messages = saved_short_term_messages[-self._recent_messages_limit :]
@@ -397,50 +485,56 @@ class ChatService:
             ),
         )
 
-    def _build_memory_stage_context(
-        self,
-        memory_snapshot: AgentMemorySnapshot,
-        stage: str,
-    ) -> str:
-        context = memory_snapshot.to_context()
-        if stage == "execution":
-            stage_instruction = (
-                "Internal stage runner: execute now. Do not write that you are starting. "
-                "Produce the concrete implementation artifact in this reply: code, patch, "
-                "file content, or the requested concrete result. "
-                f"Stage rule: {TASK_STATE_INSTRUCTIONS[stage]}"
-            )
-        elif stage == "validation":
-            stage_instruction = (
-                "Internal stage runner: validate the implementation from the previous assistant reply now. "
-                "Run or describe the relevant checks based on the available project context. "
-                "If validation passes, explicitly include 'Проверка пройдена' or 'ошибок нет'. "
-                "If validation fails, explicitly include what failed and that it needs fixing. "
-                f"Stage rule: {TASK_STATE_INSTRUCTIONS[stage]}"
-            )
-        else:
-            stage_instruction = TASK_STATE_INSTRUCTIONS[stage]
+    def _format_validation_failure(self, reply: str, issues: list[str]) -> str:
+        if not issues:
+            return reply or "Решение не прошло проверку."
 
-        return "\n\n".join(part for part in (context, stage_instruction) if part)
+        issue_lines = "\n".join(f"- {issue}" for issue in issues)
+        return f"{reply or 'Решение не прошло проверку.'}\n\nЧто нужно исправить:\n{issue_lines}"
 
-    def _format_stage_output(self, stage: str, text: str) -> str:
-        marker = TASK_STATE_MARKERS[stage]
-        return f"[{marker}]\n{text.strip()}"
+    def _format_done_answer(self, reply: str, artifact: str, validation_summary: str) -> str:
+        clean_reply = reply.strip() or "Задача завершена."
+        clean_artifact = artifact.strip()
+        clean_validation_summary = validation_summary.strip()
+        parts = [clean_reply]
 
-    def _format_memory_response(
-        self,
-        visible_outputs: list[str],
-        working_memory: WorkingMemory,
-    ) -> str:
-        response = "\n\n".join(output for output in visible_outputs if output.strip())
-        if working_memory.task_state.stage == "done" and "[ГОТОВО]" not in response:
-            return f"{response}\n\n[ГОТОВО]\nЗадача завершена.".strip()
+        if clean_validation_summary and clean_validation_summary not in clean_reply:
+            parts.append(f"Проверка:\n{clean_validation_summary}")
 
-        return response
+        if clean_artifact and clean_artifact not in clean_reply:
+            if "```" in clean_artifact:
+                parts.append(f"Решение:\n\n{clean_artifact}")
+            else:
+                parts.append(f"Решение:\n\n```text\n{clean_artifact}\n```")
+
+        return "\n\n".join(parts)
 
     def _notify_task_stage_changed(self, working_memory: WorkingMemory) -> None:
+        stage = working_memory.task_state.stage
+        if stage == self._last_notified_task_stage:
+            return
+
+        self._last_notified_task_stage = stage
         if self._on_task_stage_changed is not None:
             self._on_task_stage_changed(working_memory)
+
+    def _require_task_stage_agents(
+        self,
+    ) -> tuple[PlanningAgent, ExecutionAgent, ValidationAgent, DoneAgent]:
+        if (
+            self._planning_agent is None
+            or self._execution_agent is None
+            or self._validation_agent is None
+            or self._done_agent is None
+        ):
+            raise RuntimeError("Memory strategy requires planning, execution, validation, and done agents.")
+
+        return (
+            self._planning_agent,
+            self._execution_agent,
+            self._validation_agent,
+            self._done_agent,
+        )
 
     def _load_short_term_memory(self) -> list[Message]:
         return self._history_repository.load()
@@ -508,3 +602,10 @@ class ChatService:
         updated_summary = self._summarizer.summarize(summary.content, messages_to_summarize)
 
         return ConversationSummary(updated_summary), recent_messages
+
+
+def _read_int_item(items: dict[str, str], key: str) -> int:
+    try:
+        return int(items.get(key, "0"))
+    except ValueError:
+        return 0

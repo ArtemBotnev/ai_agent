@@ -11,6 +11,14 @@ from application.llm.llm_agent import LlmAnswer
 from application.memory.long_term_memory_extractor import LongTermMemoryExtractor
 from application.memory.working_memory_extractor import WorkingMemoryExtractor
 from application.summary.conversation_summarizer import ConversationSummarizer
+from application.workflow.task_stage_agents import (
+    DoneAgentResult,
+    ExecutionAgentResult,
+    PlanningAgentResult,
+    TaskAgentContext,
+    TaskAgentUsage,
+    ValidationAgentResult,
+)
 from domain.long_term_memory import LONG_TERM_MEMORY_SECTIONS, LongTermMemory
 from domain.message import USER_ROLE, Message
 from domain.sticky_facts import StickyFacts
@@ -55,6 +63,26 @@ LONG_TERM_MEMORY_SYSTEM_PROMPT = (
     "You update long-term memory for a chat agent. "
     "Save only durable information that should help future sessions. "
     "Separate it into profile, decisions, and knowledge. Do not store transient chat text."
+)
+PLANNING_AGENT_SYSTEM_PROMPT = (
+    "You are the planning subagent in a task state machine. "
+    "Discuss requirements, clarify missing details, and produce a short sequential plan. "
+    "Do not write code, diffs, patches, or implementation artifacts. "
+    "Return only JSON."
+)
+EXECUTION_AGENT_SYSTEM_PROMPT = (
+    "You are the execution subagent in a task state machine. "
+    "Use the confirmed plan and produce the concrete requested artifact now. "
+    "Do not say that you are starting; perform the work. Return JSON and an artifact block."
+)
+VALIDATION_AGENT_SYSTEM_PROMPT = (
+    "You are the validation subagent in a task state machine. "
+    "Validate the artifact against the task and plan. Return only JSON."
+)
+DONE_AGENT_SYSTEM_PROMPT = (
+    "You are the done subagent in a task state machine. "
+    "Write the final user-facing answer in Russian. Include the completed solution or artifact, "
+    "the validation result, and a concise summary. Do not expose internal JSON or subagent details."
 )
 
 
@@ -385,7 +413,9 @@ class SimpleWorkingMemoryExtractor(WorkingMemoryExtractor):
             "selected_approach, files, commands, status, open_questions, next_steps.\n"
             "Do not save user profile, durable decisions, or general knowledge here.\n"
             "Use null or an empty string to delete stale item data.\n"
-            "task_state must contain task, stage, step, total, plan, done, current, and paused.\n"
+            "task_state must contain task, stage, step, total, plan_step, plan_total, plan, done, current, and paused.\n"
+            "step/total is the workflow position only: planning=1/4, execution=2/4, validation=3/4, done=4/4.\n"
+            "plan_step/plan_total is the progress inside the saved execution plan.\n"
             "stage must be one of planning, execution, validation, done.\n"
             "planning means requirements, clarification, and a sequential plan; no code; "
             "this is the only conversational stage with the user.\n"
@@ -396,7 +426,7 @@ class SimpleWorkingMemoryExtractor(WorkingMemoryExtractor):
             "done means the validated task is complete and the result is fixed.\n"
             "Allowed transitions are strict: planning -> execution; "
             "execution -> validation or planning; validation -> done or execution; done -> no transition.\n"
-            "If the task changed, return the new task with stage planning, step 0, empty done.\n"
+            "If the task changed, return the new task with stage planning and empty done.\n"
             "Only use planning -> execution when the plan is ready and the user explicitly asks "
             "to implement, write code, create a class/function/file, or apply changes.\n"
             "Use execution -> planning only when the assistant needs clarification.\n"
@@ -413,6 +443,133 @@ class SimpleWorkingMemoryExtractor(WorkingMemoryExtractor):
             "rules apply and use the saved task_state to continue without asking for repeated explanation.\n\n"
             f"Current working memory:\n{memory_json}\n\n"
             f"Recent messages:\n{messages_text}"
+        )
+
+
+@dataclass
+class SimplePlanningAgent:
+    agent: SimpleLlmAgent
+
+    def run(self, context: TaskAgentContext) -> PlanningAgentResult:
+        prompt = _build_task_agent_prompt(context)
+        prompt += (
+            "\n\nReturn only JSON with this shape:\n"
+            "{\n"
+            '  "reply": "сообщение пользователю",\n'
+            '  "task": "краткое название задачи",\n'
+            '  "plan": ["шаг 1", "шаг 2"],\n'
+            '  "current": "текущий ближайший шаг",\n'
+            '  "awaiting_confirmation": true,\n'
+            '  "ready_for_execution": false\n'
+            "}\n"
+            "Set ready_for_execution=true only when the user explicitly approved the plan "
+            "or asked to implement it. Otherwise ask for confirmation or clarification."
+        )
+        prompt_message = Message(role=USER_ROLE, content=prompt)
+        prompt_tokens = self.agent.count_tokens([prompt_message])
+        answer = self.agent.ask([prompt_message])
+        payload = _parse_json_payload(answer.text) or {}
+        return PlanningAgentResult(
+            reply=_read_json_string(payload, "reply") or "Уточни требования, и я обновлю план.",
+            task=_read_json_string(payload, "task") or context.memory_snapshot.working.task_state.task,
+            plan=_read_json_string_list(payload, "plan"),
+            current=_read_json_string(payload, "current"),
+            awaiting_confirmation=_read_json_bool(payload, "awaiting_confirmation"),
+            ready_for_execution=_read_json_bool(payload, "ready_for_execution"),
+            usage=TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
+        )
+
+
+@dataclass
+class SimpleExecutionAgent:
+    agent: SimpleLlmAgent
+
+    def run(self, context: TaskAgentContext, revision_request: str = "") -> ExecutionAgentResult:
+        prompt = _build_task_agent_prompt(context)
+        if revision_request.strip():
+            prompt += f"\n\nValidation revision request:\n{revision_request.strip()}"
+        prompt += (
+            "\n\nIf requirements are enough, return exactly two fenced blocks: first JSON, then artifact.\n"
+            "```json\n"
+            "{\n"
+            '  "reply": "краткая внутренняя сводка",\n'
+            '  "needs_clarification": false,\n'
+            '  "completed_steps": ["что выполнено"],\n'
+            '  "current": "что осталось или пустая строка"\n'
+            "}\n"
+            "```\n"
+            "```text\n"
+            "the concrete artifact, code, patch, or final implementation\n"
+            "```\n"
+            "If requirements are missing, return only JSON with needs_clarification=true. "
+            "Do not write that you are starting. Produce the artifact now."
+        )
+        prompt_message = Message(role=USER_ROLE, content=prompt)
+        prompt_tokens = self.agent.count_tokens([prompt_message])
+        answer = self.agent.ask([prompt_message])
+        payload = _parse_json_payload(answer.text) or {}
+        artifact = _extract_last_fenced_block(answer.text)
+        needs_clarification = _read_json_bool(payload, "needs_clarification") or not artifact
+        return ExecutionAgentResult(
+            reply=_read_json_string(payload, "reply") or answer.text.strip(),
+            needs_clarification=needs_clarification,
+            completed_steps=_read_json_string_list(payload, "completed_steps"),
+            current=_read_json_string(payload, "current"),
+            artifact="" if needs_clarification else artifact,
+            usage=TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
+        )
+
+
+@dataclass
+class SimpleValidationAgent:
+    agent: SimpleLlmAgent
+
+    def run(self, context: TaskAgentContext, artifact: str) -> ValidationAgentResult:
+        prompt = _build_task_agent_prompt(context)
+        prompt += (
+            f"\n\nArtifact to validate:\n{artifact.strip() or 'No artifact.'}\n\n"
+            "Return only JSON with this shape:\n"
+            "{\n"
+            '  "reply": "краткий итог проверки",\n'
+            '  "valid": true,\n'
+            '  "issues": ["проблема, если есть"],\n'
+            '  "revision_request": "что исправить при повторном execution"\n'
+            "}\n"
+            "valid=true only when the artifact covers the task and plan and has no obvious issues."
+        )
+        prompt_message = Message(role=USER_ROLE, content=prompt)
+        prompt_tokens = self.agent.count_tokens([prompt_message])
+        answer = self.agent.ask([prompt_message])
+        payload = _parse_json_payload(answer.text) or {}
+        issues = _read_json_string_list(payload, "issues")
+        return ValidationAgentResult(
+            reply=_read_json_string(payload, "reply") or answer.text.strip(),
+            valid=_read_json_bool(payload, "valid") and not issues,
+            issues=issues,
+            revision_request=_read_json_string(payload, "revision_request"),
+            usage=TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
+        )
+
+
+@dataclass
+class SimpleDoneAgent:
+    agent: SimpleLlmAgent
+
+    def run(self, context: TaskAgentContext, artifact: str, validation_summary: str) -> DoneAgentResult:
+        prompt = _build_task_agent_prompt(context)
+        prompt += (
+            f"\n\nValidation summary:\n{validation_summary.strip() or 'Validation passed.'}\n\n"
+            f"Final artifact:\n{artifact.strip() or 'No artifact.'}\n\n"
+            "Write a concise final answer to the user in Russian. Include three parts: "
+            "what was done, validation result, and the final solution/artifact. "
+            "If the artifact is code or structured text, preserve it in a fenced block."
+        )
+        prompt_message = Message(role=USER_ROLE, content=prompt)
+        prompt_tokens = self.agent.count_tokens([prompt_message])
+        answer = self.agent.ask([prompt_message])
+        return DoneAgentResult(
+            reply=answer.text.strip() or "Задача завершена.",
+            usage=TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
         )
 
 
@@ -485,6 +642,18 @@ def _format_messages_for_memory(messages: Sequence[Message]) -> str:
     )
 
 
+def _build_task_agent_prompt(context: TaskAgentContext) -> str:
+    task_state = context.memory_snapshot.working.task_state
+    return (
+        f"User message:\n{context.user_message.content}\n\n"
+        f"Task state:\n{task_state.to_context()}\n\n"
+        f"User profile:\n{context.memory_snapshot.user_profile.to_context() or 'No profile.'}\n\n"
+        f"Working memory:\n{context.memory_snapshot.working.to_context() or 'No working memory.'}\n\n"
+        f"Long-term memory:\n{context.memory_snapshot.long_term.to_context() or 'No long-term memory.'}\n\n"
+        f"Recent history:\n{_format_messages_for_memory(context.memory_snapshot.short_term)}"
+    )
+
+
 def _last_user_and_assistant_text(messages: Sequence[Message]) -> tuple[str, str]:
     user_text = ""
     assistant_text = ""
@@ -495,6 +664,60 @@ def _last_user_and_assistant_text(messages: Sequence[Message]) -> tuple[str, str
             assistant_text = message.content
 
     return user_text, assistant_text
+
+
+def _read_json_string(data: dict[str, object], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _read_json_bool(data: dict[str, object], key: str) -> bool:
+    return data.get(key) is True
+
+
+def _read_json_string_list(data: dict[str, object], key: str) -> list[str]:
+    value = data.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _extract_last_fenced_block(text: str) -> str:
+    blocks = _extract_fenced_blocks(text)
+    if len(blocks) >= 2:
+        return blocks[-1]
+
+    return ""
+
+
+def _parse_json_payload(text: str) -> dict[str, object] | None:
+    for block in _extract_fenced_blocks(text):
+        parsed = _parse_json_object(block)
+        if parsed is not None:
+            return parsed
+
+    return _parse_json_object(text)
+
+
+def _extract_fenced_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    start = 0
+    while True:
+        block_start = text.find("```", start)
+        if block_start < 0:
+            break
+        content_start = text.find("\n", block_start + 3)
+        if content_start < 0:
+            break
+        block_end = text.find("```", content_start + 1)
+        if block_end < 0:
+            break
+        blocks.append(text[content_start + 1 : block_end].strip())
+        start = block_end + 3
+
+    return blocks
 
 
 def _parse_json_object(text: str) -> dict[str, object] | None:

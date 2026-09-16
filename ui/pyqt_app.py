@@ -25,7 +25,16 @@ from main import (
     build_working_memory_repository,
 )
 from ui.message_html import AGENT_AUTHOR, ERROR_AUTHOR, USER_AUTHOR, render_message_html
+from ui import colors
 from ui.pyqt_theme import COMPOSER_HEIGHT, WINDOW_STYLESHEET
+
+
+TASK_STAGE_COLORS = {
+    "planning": colors.TASK_STAGE_PLANNING,
+    "execution": colors.TASK_STAGE_EXECUTION,
+    "validation": colors.TASK_STAGE_VALIDATION,
+    "done": colors.TASK_STAGE_DONE,
+}
 
 
 def main() -> None:
@@ -349,10 +358,12 @@ def main() -> None:
             paused_text = "да" if task_state.paused else "нет"
             task = task_state.task or "не задана"
             stage_marker = TASK_STATE_MARKERS[task_state.stage]
+            stage_color = TASK_STAGE_COLORS[task_state.stage]
             self._task_state_label.setText(
                 '<div style="font-size:16px;font-weight:700;margin-bottom:4px;">Состояние задачи</div>'
                 f"<div>Задача: {html.escape(task)}</div>"
-                f"<div>Этап: {html.escape(stage_marker)} ({html.escape(task_state.stage)})</div>"
+                f'<div>Этап: <span style="color:{stage_color};font-weight:700;">'
+                f"{html.escape(stage_marker)}</span> ({html.escape(task_state.stage)})</div>"
                 f"<div>Пауза: {html.escape(paused_text)}</div>"
             )
             self._task_state_label.setVisible(True)
