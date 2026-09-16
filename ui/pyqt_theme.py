@@ -12,6 +12,14 @@ QLabel {
     color: __TEXT_MUTED__;
     font-size: 14px;
 }
+QLabel#TaskStateLabel {
+    border: 1px solid __BORDER__;
+    border-radius: 8px;
+    background: __SURFACE__;
+    color: __TEXT_PRIMARY__;
+    font-size: 13px;
+    padding: 8px 10px;
+}
 QTextBrowser,
 QTextEdit,
 QComboBox {

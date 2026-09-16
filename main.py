@@ -1,5 +1,6 @@
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from agent import (
@@ -31,6 +32,7 @@ from application.memory.working_memory_extractor import WorkingMemoryExtractor
 from application.memory.working_memory_repository import WorkingMemoryRepository
 from application.summary.conversation_summarizer import ConversationSummarizer
 from application.summary.conversation_summary_repository import ConversationSummaryRepository
+from domain.working_memory import WorkingMemory
 from infrastructure.json_branch_repository import JsonBranchRepository
 from infrastructure.json_conversation_summary_repository import JsonConversationSummaryRepository
 from infrastructure.json_long_term_memory_repository import JsonLongTermMemoryRepository
@@ -257,6 +259,7 @@ def build_chat_service(
     context_strategy: ContextStrategy | None = None,
     model_name: str | None = None,
     user_id: str | None = None,
+    on_task_stage_changed: Callable[[WorkingMemory], None] | None = None,
 ) -> ChatService:
     selected_model_name = get_model_name(model_name)
     selected_user_id = get_user_id(user_id)
@@ -275,6 +278,7 @@ def build_chat_service(
         user_profile_repository=build_user_profile_repository(selected_user_id),
         recent_messages_limit=get_recent_messages_limit(),
         context_strategy=context_strategy or get_context_strategy(),
+        on_task_stage_changed=on_task_stage_changed,
     )
 
 

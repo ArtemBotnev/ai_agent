@@ -43,8 +43,13 @@ STICKY_FACTS_SYSTEM_PROMPT = (
 )
 WORKING_MEMORY_SYSTEM_PROMPT = (
     "You update working memory for the agent's current task. "
-    "Keep only active task data: goal, constraints, inputs, plan, open questions, "
-    "files, commands, current status, and next steps. Remove stale task data."
+    "Keep only active task data and a formal task state machine. "
+    "The task stage may change only through the allowed state machine transitions. "
+    "Planning is for requirements and plan, execution is for implementation, "
+    "validation is for checks, and done is for completed validated work. "
+    "Only planning is conversational with the user; execution and validation should produce concise work results. "
+    "Pause can happen at any stage and does not change the stage. "
+    "Remove stale task data."
 )
 LONG_TERM_MEMORY_SYSTEM_PROMPT = (
     "You update long-term memory for a chat agent. "
@@ -336,24 +341,76 @@ class SimpleWorkingMemoryExtractor(WorkingMemoryExtractor):
 
         prompt = self._build_prompt(memory, messages)
         answer = self.agent.ask([Message(role=USER_ROLE, content=prompt)])
-        raw_items = _parse_json_items(answer.text)
-        if raw_items is None:
+        raw_memory = _parse_json_object(answer.text)
+        if raw_memory is None:
             return memory
 
-        return WorkingMemory(_merge_string_items(memory.items, raw_items))
+        return self._merge_memory(memory, raw_memory, messages)
+
+    def _merge_memory(
+        self,
+        memory: WorkingMemory,
+        raw_memory: dict[str, object],
+        messages: Sequence[Message],
+    ) -> WorkingMemory:
+        raw_items = raw_memory.get("items")
+        if not isinstance(raw_items, dict):
+            raw_items = raw_memory
+
+        task_state = memory.task_state
+        raw_task_state = raw_memory.get("task_state")
+        if isinstance(raw_task_state, dict):
+            user_text, assistant_text = _last_user_and_assistant_text(messages)
+            task_state = task_state.apply_update(
+                raw_task_state,
+                user_text=user_text,
+                assistant_text=assistant_text,
+            )
+
+        return WorkingMemory(
+            items=_merge_string_items(memory.items, raw_items),
+            task_state=task_state,
+        )
 
     def _build_prompt(self, memory: WorkingMemory, messages: Sequence[Message]) -> str:
-        memory_json = json.dumps(memory.items, ensure_ascii=False, indent=2)
+        memory_json = json.dumps(memory.to_dict(), ensure_ascii=False, indent=2)
         messages_text = _format_messages_for_memory(messages)
 
         return (
             "Update working memory for the current task.\n"
-            "Return only one JSON object with an items object. Keys must be strings. "
-            "Values must be strings, empty strings, or null.\n"
+            "Return only one JSON object with exactly these top-level objects: "
+            "items and task_state.\n"
+            "items keys must be strings. items values must be strings, empty strings, or null.\n"
             "Save only short-lived task state: current_goal, requirements, constraints, "
             "selected_approach, files, commands, status, open_questions, next_steps.\n"
             "Do not save user profile, durable decisions, or general knowledge here.\n"
-            "Use null or an empty string to delete stale task data.\n\n"
+            "Use null or an empty string to delete stale item data.\n"
+            "task_state must contain task, stage, step, total, plan, done, current, and paused.\n"
+            "stage must be one of planning, execution, validation, done.\n"
+            "planning means requirements, clarification, and a sequential plan; no code; "
+            "this is the only conversational stage with the user.\n"
+            "execution means writing code or creating the concrete artifact; "
+            "do not keep discussing with the user unless requirements are missing.\n"
+            "validation means tests, review, and checking the result against the plan; "
+            "show only the validation result.\n"
+            "done means the validated task is complete and the result is fixed.\n"
+            "Allowed transitions are strict: planning -> execution; "
+            "execution -> validation or planning; validation -> done or execution; done -> no transition.\n"
+            "If the task changed, return the new task with stage planning, step 0, empty done.\n"
+            "Only use planning -> execution when the plan is ready and the user explicitly asks "
+            "to implement, write code, create a class/function/file, or apply changes.\n"
+            "Use execution -> planning only when the assistant needs clarification.\n"
+            "Use execution -> validation after the assistant creates implementation artifacts.\n"
+            "Use validation -> execution when validation failed.\n"
+            "Use validation -> done when validation passed.\n"
+            "plan must be the real sequential work plan, not options or alternatives.\n"
+            "Create or refine plan only during planning. After the task leaves planning, "
+            "preserve the existing plan and update only current, done, paused, and stage.\n"
+            "done must contain completed items from plan.\n"
+            "current must be the active step or current action.\n"
+            "Set paused to true when the task is paused at any stage. "
+            "When the user asks to continue, keep the same stage unless the normal transition "
+            "rules apply and use the saved task_state to continue without asking for repeated explanation.\n\n"
             f"Current working memory:\n{memory_json}\n\n"
             f"Recent messages:\n{messages_text}"
         )
@@ -428,16 +485,16 @@ def _format_messages_for_memory(messages: Sequence[Message]) -> str:
     )
 
 
-def _parse_json_items(text: str) -> dict[str, object] | None:
-    parsed = _parse_json_object(text)
-    if parsed is None:
-        return None
+def _last_user_and_assistant_text(messages: Sequence[Message]) -> tuple[str, str]:
+    user_text = ""
+    assistant_text = ""
+    for message in messages:
+        if message.role == USER_ROLE:
+            user_text = message.content
+        elif message.role == "assistant":
+            assistant_text = message.content
 
-    raw_items = parsed.get("items")
-    if isinstance(raw_items, dict):
-        return raw_items
-
-    return parsed
+    return user_text, assistant_text
 
 
 def _parse_json_object(text: str) -> dict[str, object] | None:

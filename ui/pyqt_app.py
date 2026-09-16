@@ -1,3 +1,4 @@
+import html
 import sys
 from typing import Any
 
@@ -9,6 +10,7 @@ from domain.conversation_summary import ConversationSummary
 from domain.long_term_memory import LongTermMemory
 from domain.message import Message
 from domain.sticky_facts import StickyFacts
+from domain.task_state import TASK_STATE_MARKERS
 from domain.working_memory import WorkingMemory
 from main import build_chat_service, build_history_repository, format_agent_error, get_context_strategy
 from main import (
@@ -64,6 +66,7 @@ def main() -> None:
     class ChatWorker(QThread):
         answered = pyqtSignal(object)
         failed = pyqtSignal(str)
+        task_stage_changed = pyqtSignal(object)
 
         def __init__(
             self,
@@ -84,6 +87,7 @@ def main() -> None:
                     self._context_strategy,
                     self._model_name,
                     self._user_id,
+                    self.task_stage_changed.emit,
                 ).answer(self._message)
             except RuntimeError as error:
                 self.failed.emit(str(error))
@@ -105,6 +109,7 @@ def main() -> None:
             self._user_combo = QComboBox()
             self._model_combo = QComboBox()
             self._status_label = QLabel("Готов")
+            self._task_state_label = QLabel()
             self._strategy_combo = QComboBox()
             self._branch_combo = QComboBox()
             self._checkpoint_button = QPushButton("Checkpoint")
@@ -121,6 +126,8 @@ def main() -> None:
             self._messages.setOpenExternalLinks(False)
             self._input.setPlaceholderText("Введите сообщение")
             self._input.setFixedHeight(COMPOSER_HEIGHT)
+            self._task_state_label.setObjectName("TaskStateLabel")
+            self._task_state_label.setWordWrap(True)
             self._send_button.setFixedHeight(COMPOSER_HEIGHT)
             self._send_button.setFixedWidth(140)
             self._clear_button.setFixedHeight(36)
@@ -181,6 +188,7 @@ def main() -> None:
 
             root_layout = QVBoxLayout()
             root_layout.addLayout(header_layout)
+            root_layout.addWidget(self._task_state_label)
             root_layout.addWidget(self._messages, stretch=1)
             root_layout.addLayout(composer_layout)
 
@@ -189,6 +197,7 @@ def main() -> None:
             self.setCentralWidget(root)
             self.setStyleSheet(WINDOW_STYLESHEET)
             self._update_branch_controls()
+            self._update_task_state()
 
         def _load_history(self) -> None:
             try:
@@ -198,6 +207,7 @@ def main() -> None:
                 return
 
             self._messages.clear()
+            self._update_task_state()
             if not messages:
                 self._append_message(AGENT_AUTHOR, "Здравствуйте. Напишите запрос, и я отправлю его в LLM через агента.")
                 return
@@ -211,8 +221,11 @@ def main() -> None:
                 self._append_message(ERROR_AUTHOR, "Введите непустое сообщение.")
                 return
 
-            self._append_message(USER_AUTHOR, text)
+            self._send_text(text)
             self._input.clear()
+
+        def _send_text(self, text: str) -> None:
+            self._append_message(USER_AUTHOR, text)
             self._set_loading(True)
 
             self._worker = ChatWorker(
@@ -223,6 +236,7 @@ def main() -> None:
             )
             self._worker.answered.connect(self._handle_answer)
             self._worker.failed.connect(self._handle_error)
+            self._worker.task_stage_changed.connect(self._handle_task_stage_changed)
             self._worker.finished.connect(lambda: self._set_loading(False))
             self._worker.start()
 
@@ -238,9 +252,16 @@ def main() -> None:
                 f"история {tokens.history}, ответ {tokens.response}"
             )
             self._append_message(AGENT_AUTHOR, chat_response.text, meta)
+            self._update_task_state()
 
         def _handle_error(self, error: str) -> None:
             self._append_message(ERROR_AUTHOR, error)
+
+        def _handle_task_stage_changed(self, memory: Any) -> None:
+            if not isinstance(memory, WorkingMemory):
+                return
+
+            self._set_task_state_text(memory)
 
         def _set_loading(self, is_loading: bool) -> None:
             self._send_button.setDisabled(is_loading)
@@ -255,6 +276,7 @@ def main() -> None:
             self._status_label.setText("Запрос..." if is_loading else "Готов")
             if not is_loading:
                 self._update_branch_controls()
+                self._update_task_state()
 
         def _append_message(self, author: str, text: str, meta: str = "") -> None:
             self._messages.append(render_message_html(author, text, meta))
@@ -299,10 +321,12 @@ def main() -> None:
 
         def _handle_strategy_changed(self, *_args: Any) -> None:
             self._update_branch_controls()
+            self._update_task_state()
             self._load_history()
 
         def _handle_user_changed(self, *_args: Any) -> None:
             self._update_branch_controls()
+            self._update_task_state()
             self._load_history()
 
         def _update_branch_controls(self) -> None:
@@ -312,6 +336,26 @@ def main() -> None:
             self._new_branch_button.setVisible(is_branching)
             if is_branching:
                 self._refresh_branch_combo()
+
+        def _update_task_state(self) -> None:
+            if self._selected_strategy() != ContextStrategy.MEMORY:
+                self._task_state_label.setVisible(False)
+                return
+
+            self._set_task_state_text(build_working_memory_repository(self._selected_user_id()).load())
+
+        def _set_task_state_text(self, memory: WorkingMemory) -> None:
+            task_state = memory.task_state
+            paused_text = "да" if task_state.paused else "нет"
+            task = task_state.task or "не задана"
+            stage_marker = TASK_STATE_MARKERS[task_state.stage]
+            self._task_state_label.setText(
+                '<div style="font-size:16px;font-weight:700;margin-bottom:4px;">Состояние задачи</div>'
+                f"<div>Задача: {html.escape(task)}</div>"
+                f"<div>Этап: {html.escape(stage_marker)} ({html.escape(task_state.stage)})</div>"
+                f"<div>Пауза: {html.escape(paused_text)}</div>"
+            )
+            self._task_state_label.setVisible(True)
 
         def _refresh_branch_combo(self) -> None:
             branches = build_branch_repository().load()
@@ -404,6 +448,7 @@ def main() -> None:
                 build_history_repository(self._selected_user_id()).save([])
 
             self._load_history()
+            self._update_task_state()
 
     app = QApplication(sys.argv)
     window = ChatWindow()
