@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from enum import Enum
 
+from domain.invariants import Invariants
 from domain.long_term_memory import LongTermMemory
 from domain.message import Message
 from domain.user_profile import UserProfile
@@ -17,12 +18,14 @@ class MemoryType(Enum):
 class AgentMemorySnapshot:
     short_term: list[Message]
     user_profile: UserProfile
+    invariants: Invariants
     working: WorkingMemory
     long_term: LongTermMemory
 
     def to_context(self) -> str:
         context_parts = [
             self.user_profile.to_context(),
+            self.invariants.to_context(),
             self.working.to_context(),
             self.long_term.to_context(),
         ]

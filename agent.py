@@ -35,7 +35,12 @@ AVAILABLE_OPENAI_MODELS = (
 )
 OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_RESPONSES_INPUT_TOKENS_API_URL = "https://api.openai.com/v1/responses/input_tokens"
-DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and concisely."
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant. Answer clearly and concisely. "
+    "When invariants are provided, treat them as mandatory constraints. "
+    "Refuse to propose or implement solutions that violate them, name the violated invariant, "
+    "and offer a compliant alternative."
+)
 SUMMARY_SYSTEM_PROMPT = (
     "You summarize earlier chat messages for future context. "
     "Keep stable facts, user preferences, decisions, constraints, open tasks, "
@@ -68,21 +73,36 @@ PLANNING_AGENT_SYSTEM_PROMPT = (
     "You are the planning subagent in a task state machine. "
     "Discuss requirements, clarify missing details, and produce a short sequential plan. "
     "Do not write code, diffs, patches, or implementation artifacts. "
+    "You must follow all invariants. If the user's request or a possible solution violates an invariant, "
+    "refuse that solution, name the violated invariant, and offer a compliant alternative. "
+    "When the request is about architecture, check architecture invariants first and report those violations directly. "
+    "Do not answer only with stack constraints when an architecture invariant is the relevant conflict. "
+    "Do not set ready_for_execution=true when invariants are violated. "
     "Return only JSON."
 )
 EXECUTION_AGENT_SYSTEM_PROMPT = (
     "You are the execution subagent in a task state machine. "
     "Use the confirmed plan and produce the concrete requested artifact now. "
-    "Do not say that you are starting; perform the work. Return JSON and an artifact block."
+    "You must follow all invariants. Do not implement artifacts that violate invariants. "
+    "If the requested artifact would violate an invariant, return needs_clarification=true and explain the violation. "
+    "If the violation is architectural, name the architecture invariant that blocks the artifact. "
+    "The artifact must be the final implementation, code, patch, or document requested by the task, "
+    "not a summary of what should be implemented. Do not say that you are starting; perform the work. "
+    "Return JSON and an artifact block."
 )
 VALIDATION_AGENT_SYSTEM_PROMPT = (
     "You are the validation subagent in a task state machine. "
-    "Validate the artifact against the task and plan. Return only JSON."
+    "Validate the artifact against the task, plan, and all invariants. "
+    "Set valid=false if the artifact violates any invariant or if the artifact is only a summary "
+    "instead of the concrete requested implementation. Architecture invariants must be checked explicitly. "
+    "Return only JSON."
 )
 DONE_AGENT_SYSTEM_PROMPT = (
     "You are the done subagent in a task state machine. "
     "Write the final user-facing answer in Russian. Include the completed solution or artifact, "
-    "the validation result, and a concise summary. Do not expose internal JSON or subagent details."
+    "the validation result, and a concise summary. "
+    "You must follow all invariants and must not present an artifact that violates them. "
+    "Do not expose internal JSON or subagent details."
 )
 
 
@@ -460,10 +480,22 @@ class SimplePlanningAgent:
             '  "plan": ["шаг 1", "шаг 2"],\n'
             '  "current": "текущий ближайший шаг",\n'
             '  "awaiting_confirmation": true,\n'
-            '  "ready_for_execution": false\n'
+            '  "ready_for_execution": false,\n'
+            '  "invariant_check": "как план учитывает инварианты",\n'
+            '  "violates_invariants": false,\n'
+            '  "violated_invariants": []\n'
             "}\n"
-            "Set ready_for_execution=true only when the user explicitly approved the plan "
-            "or asked to implement it. Otherwise ask for confirmation or clarification."
+            "Set ready_for_execution=true only when the user clearly asks to start implementation, "
+            "write code, apply changes, create files/classes/functions, or otherwise perform the artifact work. "
+            "Short ambiguous confirmations such as 'давай', 'делай', 'пиши', 'ок', 'окей', "
+            "'согласен', 'начинай', or 'начни' are not enough: ask one explicit confirmation question "
+            "that says whether to start execution now. If the user gives explicit execution approval "
+            "and the plan follows all invariants, set ready_for_execution=true instead of repeating the same plan. "
+            "Otherwise ask for confirmation or clarification. "
+            "If the user request or plan violates invariants, set violates_invariants=true, "
+            "ready_for_execution=false, and explain the refusal in reply. "
+            "violated_invariants must contain the exact closest violated invariant bullets, "
+            "including architecture bullets when the conflict is architectural."
         )
         prompt_message = Message(role=USER_ROLE, content=prompt)
         prompt_tokens = self.agent.count_tokens([prompt_message])
@@ -476,6 +508,9 @@ class SimplePlanningAgent:
             current=_read_json_string(payload, "current"),
             awaiting_confirmation=_read_json_bool(payload, "awaiting_confirmation"),
             ready_for_execution=_read_json_bool(payload, "ready_for_execution"),
+            invariant_check=_read_json_string(payload, "invariant_check"),
+            violates_invariants=_read_json_bool(payload, "violates_invariants"),
+            violated_invariants=_read_json_string_list(payload, "violated_invariants"),
             usage=TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
         )
 
@@ -502,6 +537,11 @@ class SimpleExecutionAgent:
             "the concrete artifact, code, patch, or final implementation\n"
             "```\n"
             "If requirements are missing, return only JSON with needs_clarification=true. "
+            "If producing the artifact would violate invariants, return only JSON with "
+            "needs_clarification=true and explain the violated invariant in reply. "
+            "For an architecture conflict, cite the architecture invariant, not unrelated stack constraints. "
+            "Never put a summary like 'implemented with X' into the artifact block when code, "
+            "a patch, or another concrete implementation was requested. "
             "Do not write that you are starting. Produce the artifact now."
         )
         prompt_message = Message(role=USER_ROLE, content=prompt)
@@ -533,19 +573,32 @@ class SimpleValidationAgent:
             '  "reply": "краткий итог проверки",\n'
             '  "valid": true,\n'
             '  "issues": ["проблема, если есть"],\n'
+            '  "invariant_violations": ["нарушенный инвариант, если есть"],\n'
+            '  "artifact_is_concrete": true,\n'
             '  "revision_request": "что исправить при повторном execution"\n'
             "}\n"
-            "valid=true only when the artifact covers the task and plan and has no obvious issues."
+            "valid=true only when the artifact covers the task and plan, follows all invariants, "
+            "is a concrete requested artifact rather than a summary, and has no obvious issues. "
+            "If invariants say to use one technology only, any artifact using a competing technology "
+            "must be invalid and listed in invariant_violations. If the artifact uses a competing "
+            "architecture pattern, list the architecture invariant in invariant_violations."
         )
         prompt_message = Message(role=USER_ROLE, content=prompt)
         prompt_tokens = self.agent.count_tokens([prompt_message])
         answer = self.agent.ask([prompt_message])
         payload = _parse_json_payload(answer.text) or {}
         issues = _read_json_string_list(payload, "issues")
+        invariant_violations = _read_json_string_list(payload, "invariant_violations")
+        artifact_is_concrete = _read_json_bool(payload, "artifact_is_concrete")
         return ValidationAgentResult(
             reply=_read_json_string(payload, "reply") or answer.text.strip(),
-            valid=_read_json_bool(payload, "valid") and not issues,
+            valid=_read_json_bool(payload, "valid")
+            and not issues
+            and not invariant_violations
+            and artifact_is_concrete,
             issues=issues,
+            invariant_violations=invariant_violations,
+            artifact_is_concrete=artifact_is_concrete,
             revision_request=_read_json_string(payload, "revision_request"),
             usage=TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
         )
@@ -648,6 +701,12 @@ def _build_task_agent_prompt(context: TaskAgentContext) -> str:
         f"User message:\n{context.user_message.content}\n\n"
         f"Task state:\n{task_state.to_context()}\n\n"
         f"User profile:\n{context.memory_snapshot.user_profile.to_context() or 'No profile.'}\n\n"
+        f"Invariants:\n{context.memory_snapshot.invariants.to_context() or 'No invariants.'}\n\n"
+        "Invariant handling rules:\n"
+        "- Check all invariant sections before planning, executing, or validating.\n"
+        "- If the request conflicts with an architecture invariant, refuse because of that architecture invariant.\n"
+        "- Name the closest matching violated invariant bullet instead of mentioning unrelated constraints.\n"
+        "- A request to use one architecture pattern violates an invariant that says to use a different pattern only.\n\n"
         f"Working memory:\n{context.memory_snapshot.working.to_context() or 'No working memory.'}\n\n"
         f"Long-term memory:\n{context.memory_snapshot.long_term.to_context() or 'No long-term memory.'}\n\n"
         f"Recent history:\n{_format_messages_for_memory(context.memory_snapshot.short_term)}"

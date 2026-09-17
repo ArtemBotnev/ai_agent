@@ -10,6 +10,7 @@ from application.facts.sticky_facts_repository import StickyFactsRepository
 from application.llm.llm_agent import LlmAgent
 from application.memory.long_term_memory_extractor import LongTermMemoryExtractor
 from application.memory.long_term_memory_repository import LongTermMemoryRepository
+from application.memory.invariants_repository import InvariantsRepository
 from application.memory.user_profile_repository import UserProfileRepository
 from application.memory.working_memory_extractor import WorkingMemoryExtractor
 from application.memory.working_memory_repository import WorkingMemoryRepository
@@ -21,6 +22,7 @@ from application.workflow.task_stage_agents import (
     PlanningAgent,
     TaskAgentContext,
     ValidationAgent,
+    ValidationAgentResult,
 )
 from domain.agent_memory import AgentMemorySnapshot
 from domain.conversation_branch import (
@@ -65,6 +67,7 @@ class ChatService:
         long_term_memory_repository: LongTermMemoryRepository | None = None,
         long_term_memory_extractor: LongTermMemoryExtractor | None = None,
         user_profile_repository: UserProfileRepository | None = None,
+        invariants_repository: InvariantsRepository | None = None,
         recent_messages_limit: int = DEFAULT_RECENT_MESSAGES_LIMIT,
         context_strategy: ContextStrategy = ContextStrategy.MEMORY,
         on_task_stage_changed: Callable[[WorkingMemory], None] | None = None,
@@ -85,6 +88,7 @@ class ChatService:
         self._long_term_memory_repository = long_term_memory_repository
         self._long_term_memory_extractor = long_term_memory_extractor
         self._user_profile_repository = user_profile_repository
+        self._invariants_repository = invariants_repository
         self._recent_messages_limit = recent_messages_limit
         self._context_strategy = context_strategy
         self._on_task_stage_changed = on_task_stage_changed
@@ -329,12 +333,14 @@ class ChatService:
             long_term_memory_repository,
             long_term_memory_extractor,
             user_profile_repository,
+            invariants_repository,
         ) = self._require_memory_components()
         planning_agent, execution_agent, validation_agent, done_agent = self._require_task_stage_agents()
 
         short_term_messages = self._load_short_term_memory()
         saved_short_term_messages = list(short_term_messages)
         user_profile = user_profile_repository.load()
+        invariants = invariants_repository.load()
         working_memory = working_memory_repository.load()
         long_term_memory = long_term_memory_repository.load()
         prepared_task_state = working_memory.task_state.prepare_for_user_message(current_message.content)
@@ -362,6 +368,7 @@ class ChatService:
             memory_snapshot = AgentMemorySnapshot(
                 short_term=short_term_messages,
                 user_profile=user_profile,
+                invariants=invariants,
                 working=working_memory,
                 long_term=long_term_memory,
             )
@@ -375,23 +382,28 @@ class ChatService:
                 result = planning_agent.run(task_context)
                 history_tokens += result.usage.prompt_tokens
                 response_tokens += result.usage.response_tokens
+                ready_for_execution = result.ready_for_execution and not result.violates_invariants
                 previous_stage = working_memory.task_state.stage
                 working_memory = WorkingMemory(
                     items={
                         **working_memory.items,
                         "revision_request": "",
                         "validation_attempts": "0",
+                        "last_invariant_check": result.invariant_check,
                     },
                     task_state=working_memory.task_state.apply_planning_result(
                         task=result.task,
                         plan=result.plan,
                         current=result.current,
-                        ready_for_execution=result.ready_for_execution,
+                        ready_for_execution=ready_for_execution,
                     ),
                 )
                 if working_memory.task_state.stage != previous_stage:
                     self._notify_task_stage_changed(working_memory)
-                if not result.ready_for_execution:
+                if result.violates_invariants:
+                    final_answer = self._format_invariant_refusal(result.reply, result.violated_invariants)
+                    break
+                if not ready_for_execution:
                     final_answer = result.reply
                     break
                 short_term_messages.append(Message(role=ASSISTANT_ROLE, content=result.reply))
@@ -431,13 +443,14 @@ class ChatService:
                 history_tokens += result.usage.prompt_tokens
                 response_tokens += result.usage.response_tokens
                 validation_summary = result.reply
+                validation_issues = self._build_validation_issues(result)
                 previous_stage = working_memory.task_state.stage
                 if result.valid:
                     revision_request = ""
                     validation_attempts = 0
                 else:
                     validation_attempts += 1
-                    revision_request = result.revision_request or "; ".join(result.issues)
+                    revision_request = result.revision_request or "; ".join(validation_issues)
                 working_memory = WorkingMemory(
                     items={
                         **working_memory.items,
@@ -454,7 +467,7 @@ class ChatService:
                 if working_memory.task_state.stage != previous_stage:
                     self._notify_task_stage_changed(working_memory)
                 if not result.valid and validation_attempts >= 2:
-                    final_answer = self._format_validation_failure(result.reply, result.issues)
+                    final_answer = self._format_validation_failure(result.reply, validation_issues)
                     break
                 short_term_messages.append(Message(role=ASSISTANT_ROLE, content=result.reply))
                 short_term_messages = short_term_messages[-self._recent_messages_limit :]
@@ -491,6 +504,22 @@ class ChatService:
 
         issue_lines = "\n".join(f"- {issue}" for issue in issues)
         return f"{reply or 'Решение не прошло проверку.'}\n\nЧто нужно исправить:\n{issue_lines}"
+
+    def _build_validation_issues(self, result: ValidationAgentResult) -> list[str]:
+        issues = list(result.issues)
+        issues.extend(result.invariant_violations)
+        if not result.artifact_is_concrete:
+            issues.append("Artifact должен содержать конкретное решение, а не сводку.")
+
+        return issues
+
+    def _format_invariant_refusal(self, reply: str, violated_invariants: list[str]) -> str:
+        clean_reply = reply.strip() or "Не могу предложить это решение, потому что оно нарушает инварианты."
+        if not violated_invariants:
+            return clean_reply
+
+        invariant_lines = "\n".join(f"- {invariant}" for invariant in violated_invariants)
+        return f"{clean_reply}\n\nНарушенные инварианты:\n{invariant_lines}"
 
     def _format_done_answer(self, reply: str, artifact: str, validation_summary: str) -> str:
         clean_reply = reply.strip() or "Задача завершена."
@@ -553,6 +582,7 @@ class ChatService:
             long_term_memory_repository,
             _long_term_memory_extractor,
             _user_profile_repository,
+            _invariants_repository,
         ) = self._require_memory_components()
         long_term_memory_repository.save(memory)
 
@@ -561,7 +591,15 @@ class ChatService:
         if self._user_profile_repository is not None:
             profile_context = self._user_profile_repository.load().to_context()
 
-        return "\n\n".join(part.strip() for part in (profile_context, *parts) if part.strip())
+        invariants_context = ""
+        if self._invariants_repository is not None:
+            invariants_context = self._invariants_repository.load().to_context()
+
+        return "\n\n".join(
+            part.strip()
+            for part in (profile_context, invariants_context, *parts)
+            if part.strip()
+        )
 
     def _require_memory_components(
         self,
@@ -571,6 +609,7 @@ class ChatService:
         LongTermMemoryRepository,
         LongTermMemoryExtractor,
         UserProfileRepository,
+        InvariantsRepository,
     ]:
         if (
             self._working_memory_repository is None
@@ -578,8 +617,11 @@ class ChatService:
             or self._long_term_memory_repository is None
             or self._long_term_memory_extractor is None
             or self._user_profile_repository is None
+            or self._invariants_repository is None
         ):
-            raise RuntimeError("Memory strategy requires user profile, working, and long-term memory components.")
+            raise RuntimeError(
+                "Memory strategy requires user profile, invariants, working, and long-term memory components."
+            )
 
         return (
             self._working_memory_repository,
@@ -587,6 +629,7 @@ class ChatService:
             self._long_term_memory_repository,
             self._long_term_memory_extractor,
             self._user_profile_repository,
+            self._invariants_repository,
         )
 
     def _compact_history(

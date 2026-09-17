@@ -35,6 +35,7 @@ from application.facts.sticky_facts_extractor import StickyFactsExtractor
 from application.facts.sticky_facts_repository import StickyFactsRepository
 from application.memory.long_term_memory_extractor import LongTermMemoryExtractor
 from application.memory.long_term_memory_repository import LongTermMemoryRepository
+from application.memory.invariants_repository import InvariantsRepository
 from application.memory.user_profile_repository import UserProfileRepository
 from application.memory.working_memory_extractor import WorkingMemoryExtractor
 from application.memory.working_memory_repository import WorkingMemoryRepository
@@ -48,6 +49,7 @@ from infrastructure.json_long_term_memory_repository import JsonLongTermMemoryRe
 from infrastructure.json_message_history_repository import JsonMessageHistoryRepository
 from infrastructure.json_sticky_facts_repository import JsonStickyFactsRepository
 from infrastructure.json_working_memory_repository import JsonWorkingMemoryRepository
+from infrastructure.markdown_invariants_repository import MarkdownInvariantsRepository
 from infrastructure.markdown_user_profile_repository import MarkdownUserProfileRepository
 
 DEFAULT_SUMMARY_FILE = Path("history/summary.json")
@@ -56,6 +58,7 @@ DEFAULT_BRANCHES_FILE = Path("history/branches.json")
 DEFAULT_USER_ID = "1"
 DEFAULT_MEMORY_DIR = Path("memory/users")
 DEFAULT_PROFILES_DIR = Path("profiles/users")
+DEFAULT_INVARIANTS_DIR = Path("invariants/users")
 AGENT_HISTORY_FILE_ENV = "AGENT_HISTORY_FILE"
 AGENT_SUMMARY_FILE_ENV = "AGENT_SUMMARY_FILE"
 AGENT_FACTS_FILE_ENV = "AGENT_FACTS_FILE"
@@ -63,6 +66,7 @@ AGENT_BRANCHES_FILE_ENV = "AGENT_BRANCHES_FILE"
 AGENT_WORKING_MEMORY_FILE_ENV = "AGENT_WORKING_MEMORY_FILE"
 AGENT_LONG_TERM_MEMORY_FILE_ENV = "AGENT_LONG_TERM_MEMORY_FILE"
 AGENT_USER_PROFILE_FILE_ENV = "AGENT_USER_PROFILE_FILE"
+AGENT_INVARIANTS_FILE_ENV = "AGENT_INVARIANTS_FILE"
 AGENT_USER_ID_ENV = "AGENT_USER_ID"
 AGENT_RECENT_MESSAGES_LIMIT_ENV = "AGENT_RECENT_MESSAGES_LIMIT"
 AGENT_CONTEXT_STRATEGY_ENV = "AGENT_CONTEXT_STRATEGY"
@@ -221,7 +225,7 @@ def get_user_id(user_id: str | None = None) -> str:
 
 def get_available_user_ids() -> list[str]:
     user_ids = {get_user_id()}
-    for users_dir in (DEFAULT_MEMORY_DIR, DEFAULT_PROFILES_DIR):
+    for users_dir in (DEFAULT_MEMORY_DIR, DEFAULT_PROFILES_DIR, DEFAULT_INVARIANTS_DIR):
         if not users_dir.exists():
             continue
 
@@ -245,6 +249,10 @@ def build_user_profile_file(user_id: str | None = None) -> Path:
     return DEFAULT_PROFILES_DIR / get_user_id(user_id) / "profile.md"
 
 
+def build_user_invariants_file(user_id: str | None = None) -> Path:
+    return DEFAULT_INVARIANTS_DIR / get_user_id(user_id) / "invariants.md"
+
+
 def build_user_profile_repository(user_id: str | None = None) -> UserProfileRepository:
     profile_file = Path(
         os.getenv(
@@ -253,6 +261,16 @@ def build_user_profile_repository(user_id: str | None = None) -> UserProfileRepo
         )
     )
     return MarkdownUserProfileRepository(profile_file)
+
+
+def build_invariants_repository(user_id: str | None = None) -> InvariantsRepository:
+    invariants_file = Path(
+        os.getenv(
+            AGENT_INVARIANTS_FILE_ENV,
+            str(build_user_invariants_file(user_id)),
+        )
+    )
+    return MarkdownInvariantsRepository(invariants_file)
 
 
 def build_working_memory_repository(user_id: str | None = None) -> WorkingMemoryRepository:
@@ -321,6 +339,7 @@ def build_chat_service(
         long_term_memory_repository=build_long_term_memory_repository(selected_user_id),
         long_term_memory_extractor=build_long_term_memory_extractor(selected_model_name),
         user_profile_repository=build_user_profile_repository(selected_user_id),
+        invariants_repository=build_invariants_repository(selected_user_id),
         recent_messages_limit=get_recent_messages_limit(),
         context_strategy=context_strategy or get_context_strategy(),
         on_task_stage_changed=on_task_stage_changed,

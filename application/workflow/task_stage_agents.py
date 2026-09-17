@@ -25,6 +25,9 @@ class PlanningAgentResult:
     current: str = ""
     awaiting_confirmation: bool = False
     ready_for_execution: bool = False
+    invariant_check: str = ""
+    violates_invariants: bool = False
+    violated_invariants: list[str] = field(default_factory=list)
     usage: TaskAgentUsage = field(default_factory=TaskAgentUsage)
 
 
@@ -43,6 +46,8 @@ class ValidationAgentResult:
     reply: str
     valid: bool = False
     issues: list[str] = field(default_factory=list)
+    invariant_violations: list[str] = field(default_factory=list)
+    artifact_is_concrete: bool = True
     revision_request: str = ""
     usage: TaskAgentUsage = field(default_factory=TaskAgentUsage)
 
