@@ -8,10 +8,15 @@ from agent import (
     DEFAULT_OPENAI_MODEL,
     OPENAI_API_KEY_ENV,
     OPENAI_MODEL_ENV,
+    PLANNING_ANALYST_SYSTEM_PROMPT,
     LONG_TERM_MEMORY_SYSTEM_PROMPT,
     DONE_AGENT_SYSTEM_PROMPT,
+    DebatingPlanningAgent,
+    PLANNING_DEVELOPER_SYSTEM_PROMPT,
+    PLANNING_DESIGNER_SYSTEM_PROMPT,
     EXECUTION_AGENT_SYSTEM_PROMPT,
     PLANNING_AGENT_SYSTEM_PROMPT,
+    PLANNING_SYNTHESIZER_SYSTEM_PROMPT,
     STICKY_FACTS_SYSTEM_PROMPT,
     SUMMARY_SYSTEM_PROMPT,
     SimpleDoneAgent,
@@ -70,6 +75,10 @@ AGENT_INVARIANTS_FILE_ENV = "AGENT_INVARIANTS_FILE"
 AGENT_USER_ID_ENV = "AGENT_USER_ID"
 AGENT_RECENT_MESSAGES_LIMIT_ENV = "AGENT_RECENT_MESSAGES_LIMIT"
 AGENT_CONTEXT_STRATEGY_ENV = "AGENT_CONTEXT_STRATEGY"
+AGENT_PLANNING_MODE_ENV = "AGENT_PLANNING_MODE"
+PLANNING_MODE_SINGLE = "single"
+PLANNING_MODE_DEBATE = "debate"
+PLANNING_MODES = (PLANNING_MODE_SINGLE, PLANNING_MODE_DEBATE)
 
 
 AGENT_ERROR_MESSAGES = {
@@ -125,12 +134,44 @@ def build_long_term_memory_extractor(model_name: str | None = None) -> LongTermM
 
 
 def build_planning_agent(model_name: str | None = None) -> PlanningAgent:
-    planning_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=get_model_name(model_name),
-        system_prompt=PLANNING_AGENT_SYSTEM_PROMPT,
+    selected_model_name = get_model_name(model_name)
+    single_planning_agent = SimplePlanningAgent(
+        SimpleLlmAgent(
+            api_key=get_api_key(),
+            model=selected_model_name,
+            system_prompt=PLANNING_AGENT_SYSTEM_PROMPT,
+        )
     )
-    return SimplePlanningAgent(planning_agent)
+    if get_planning_mode() == PLANNING_MODE_SINGLE:
+        return single_planning_agent
+
+    analyst_agent = SimpleLlmAgent(
+        api_key=get_api_key(),
+        model=selected_model_name,
+        system_prompt=PLANNING_ANALYST_SYSTEM_PROMPT,
+    )
+    developer_agent = SimpleLlmAgent(
+        api_key=get_api_key(),
+        model=selected_model_name,
+        system_prompt=PLANNING_DEVELOPER_SYSTEM_PROMPT,
+    )
+    designer_agent = SimpleLlmAgent(
+        api_key=get_api_key(),
+        model=selected_model_name,
+        system_prompt=PLANNING_DESIGNER_SYSTEM_PROMPT,
+    )
+    synthesizer_agent = SimpleLlmAgent(
+        api_key=get_api_key(),
+        model=selected_model_name,
+        system_prompt=PLANNING_SYNTHESIZER_SYSTEM_PROMPT,
+    )
+    return DebatingPlanningAgent(
+        analyst_agent=analyst_agent,
+        developer_agent=developer_agent,
+        designer_agent=designer_agent,
+        synthesizer_agent=synthesizer_agent,
+        fallback_agent=single_planning_agent,
+    )
 
 
 def build_execution_agent(model_name: str | None = None) -> ExecutionAgent:
@@ -316,6 +357,15 @@ def get_context_strategy() -> ContextStrategy:
         raise RuntimeError(
             f"Переменная {AGENT_CONTEXT_STRATEGY_ENV} должна быть одной из: {supported_values}."
         ) from error
+
+
+def get_planning_mode() -> str:
+    planning_mode = os.getenv(AGENT_PLANNING_MODE_ENV, PLANNING_MODE_DEBATE).strip().lower()
+    if planning_mode not in PLANNING_MODES:
+        available_modes = ", ".join(PLANNING_MODES)
+        raise RuntimeError(f"Переменная {AGENT_PLANNING_MODE_ENV} должна быть одной из: {available_modes}.")
+
+    return planning_mode
 
 
 def build_chat_service(

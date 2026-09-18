@@ -14,6 +14,7 @@ from application.summary.conversation_summarizer import ConversationSummarizer
 from application.workflow.task_stage_agents import (
     DoneAgentResult,
     ExecutionAgentResult,
+    PlanningAgent,
     PlanningAgentResult,
     TaskAgentContext,
     TaskAgentUsage,
@@ -78,6 +79,30 @@ PLANNING_AGENT_SYSTEM_PROMPT = (
     "When the request is about architecture, check architecture invariants first and report those violations directly. "
     "Do not answer only with stack constraints when an architecture invariant is the relevant conflict. "
     "Do not set ready_for_execution=true when invariants are violated. "
+    "Return only JSON."
+)
+PLANNING_ANALYST_SYSTEM_PROMPT = (
+    "You are the analyst role inside a planning debate. "
+    "Focus on user intent, requirements, scope, missing information, business rules, risks, "
+    "and whether the task is ready to move forward. You must follow all invariants. "
+    "Use only the compact internal protocol requested by the prompt."
+)
+PLANNING_DEVELOPER_SYSTEM_PROMPT = (
+    "You are the developer role inside a planning debate. "
+    "Focus on architecture, implementation feasibility, clean boundaries, state-machine impact, "
+    "test strategy, and technical risks. You must follow all invariants. "
+    "Use only the compact internal protocol requested by the prompt."
+)
+PLANNING_DESIGNER_SYSTEM_PROMPT = (
+    "You are the designer role inside a planning debate. "
+    "Focus on UX, UI implications, interaction clarity, visual constraints, accessibility, "
+    "and product consistency. You must follow all invariants. "
+    "Use only the compact internal protocol requested by the prompt."
+)
+PLANNING_SYNTHESIZER_SYSTEM_PROMPT = (
+    "You are the synthesizer for a planning debate. "
+    "Read compact internal debate notes, resolve conflicts, enforce all invariants, "
+    "and produce the final planning result for the task state machine. "
     "Return only JSON."
 )
 EXECUTION_AGENT_SYSTEM_PROMPT = (
@@ -472,46 +497,132 @@ class SimplePlanningAgent:
 
     def run(self, context: TaskAgentContext) -> PlanningAgentResult:
         prompt = _build_task_agent_prompt(context)
-        prompt += (
-            "\n\nReturn only JSON with this shape:\n"
-            "{\n"
-            '  "reply": "сообщение пользователю",\n'
-            '  "task": "краткое название задачи",\n'
-            '  "plan": ["шаг 1", "шаг 2"],\n'
-            '  "current": "текущий ближайший шаг",\n'
-            '  "awaiting_confirmation": true,\n'
-            '  "ready_for_execution": false,\n'
-            '  "invariant_check": "как план учитывает инварианты",\n'
-            '  "violates_invariants": false,\n'
-            '  "violated_invariants": []\n'
-            "}\n"
-            "Set ready_for_execution=true only when the user clearly asks to start implementation, "
-            "write code, apply changes, create files/classes/functions, or otherwise perform the artifact work. "
-            "Short ambiguous confirmations such as 'давай', 'делай', 'пиши', 'ок', 'окей', "
-            "'согласен', 'начинай', or 'начни' are not enough: ask one explicit confirmation question "
-            "that says whether to start execution now. If the user gives explicit execution approval "
-            "and the plan follows all invariants, set ready_for_execution=true instead of repeating the same plan. "
-            "Otherwise ask for confirmation or clarification. "
-            "If the user request or plan violates invariants, set violates_invariants=true, "
-            "ready_for_execution=false, and explain the refusal in reply. "
-            "violated_invariants must contain the exact closest violated invariant bullets, "
-            "including architecture bullets when the conflict is architectural."
-        )
+        prompt += _build_final_planning_json_instructions()
         prompt_message = Message(role=USER_ROLE, content=prompt)
         prompt_tokens = self.agent.count_tokens([prompt_message])
         answer = self.agent.ask([prompt_message])
         payload = _parse_json_payload(answer.text) or {}
-        return PlanningAgentResult(
-            reply=_read_json_string(payload, "reply") or "Уточни требования, и я обновлю план.",
-            task=_read_json_string(payload, "task") or context.memory_snapshot.working.task_state.task,
-            plan=_read_json_string_list(payload, "plan"),
-            current=_read_json_string(payload, "current"),
-            awaiting_confirmation=_read_json_bool(payload, "awaiting_confirmation"),
-            ready_for_execution=_read_json_bool(payload, "ready_for_execution"),
-            invariant_check=_read_json_string(payload, "invariant_check"),
-            violates_invariants=_read_json_bool(payload, "violates_invariants"),
-            violated_invariants=_read_json_string_list(payload, "violated_invariants"),
-            usage=TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
+        result = _planning_result_from_payload(
+            payload,
+            context,
+            TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
+        )
+        return _apply_explicit_execution_approval(result, context)
+
+
+@dataclass
+class DebatingPlanningAgent:
+    analyst_agent: SimpleLlmAgent
+    developer_agent: SimpleLlmAgent
+    designer_agent: SimpleLlmAgent
+    synthesizer_agent: SimpleLlmAgent
+    fallback_agent: PlanningAgent | None = None
+
+    def run(self, context: TaskAgentContext) -> PlanningAgentResult:
+        base_prompt = _build_task_agent_prompt(context)
+        usage = TaskAgentUsage()
+        notes: list[str] = []
+
+        initial_notes, usage = self._collect_initial_notes(base_prompt, usage)
+        notes.extend(initial_notes)
+
+        review_notes, usage = self._collect_review_notes(base_prompt, notes, usage)
+        notes.extend(review_notes)
+
+        try:
+            result, synthesis_usage = self._synthesize(context, base_prompt, notes)
+        except AgentError:
+            if self.fallback_agent is None:
+                raise
+            fallback_result = self.fallback_agent.run(context)
+            return _with_added_usage(fallback_result, usage)
+
+        usage = _add_usage(usage, synthesis_usage)
+        if not _planning_result_has_required_payload(result):
+            if self.fallback_agent is None:
+                return result
+            fallback_result = self.fallback_agent.run(context)
+            return _with_added_usage(fallback_result, usage)
+
+        result = _apply_explicit_execution_approval(result, context)
+        return _with_usage(result, usage)
+
+    def _collect_initial_notes(
+        self,
+        base_prompt: str,
+        usage: TaskAgentUsage,
+    ) -> tuple[list[str], TaskAgentUsage]:
+        notes: list[str] = []
+        for role, agent in self._role_agents():
+            prompt = _build_debate_role_prompt(base_prompt, role)
+            note, note_usage = self._ask_for_note(agent, prompt, role)
+            notes.append(note)
+            usage = _add_usage(usage, note_usage)
+
+        return notes, usage
+
+    def _collect_review_notes(
+        self,
+        base_prompt: str,
+        previous_notes: list[str],
+        usage: TaskAgentUsage,
+    ) -> tuple[list[str], TaskAgentUsage]:
+        notes: list[str] = []
+        transcript = "\n".join(previous_notes)
+        for role, agent in self._role_agents():
+            prompt = _build_debate_review_prompt(base_prompt, role, transcript)
+            note, note_usage = self._ask_for_note(agent, prompt, role)
+            notes.append(note)
+            usage = _add_usage(usage, note_usage)
+
+        return notes, usage
+
+    def _synthesize(
+        self,
+        context: TaskAgentContext,
+        base_prompt: str,
+        notes: list[str],
+    ) -> tuple[PlanningAgentResult, TaskAgentUsage]:
+        prompt = _build_debate_synthesis_prompt(base_prompt, notes)
+        prompt_message = Message(role=USER_ROLE, content=prompt)
+        prompt_tokens = self.synthesizer_agent.count_tokens([prompt_message])
+        answer = self.synthesizer_agent.ask([prompt_message])
+        payload = _parse_json_payload(answer.text) or {}
+        return (
+            _planning_result_from_payload(
+                payload,
+                context,
+                TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
+            ),
+            TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
+        )
+
+    def _ask_for_note(
+        self,
+        agent: SimpleLlmAgent,
+        prompt: str,
+        role: str,
+    ) -> tuple[str, TaskAgentUsage]:
+        prompt_message = Message(role=USER_ROLE, content=prompt)
+        try:
+            prompt_tokens = agent.count_tokens([prompt_message])
+            answer = agent.ask([prompt_message])
+        except AgentError as error:
+            return (
+                f'(fail :r {role} :err "{error.code.value}")',
+                TaskAgentUsage(),
+            )
+
+        return (
+            _compact_internal_note(answer.text, role),
+            TaskAgentUsage(prompt_tokens=prompt_tokens, response_tokens=answer.response_tokens),
+        )
+
+    def _role_agents(self) -> tuple[tuple[str, SimpleLlmAgent], ...]:
+        return (
+            ("analyst", self.analyst_agent),
+            ("dev", self.developer_agent),
+            ("design", self.designer_agent),
         )
 
 
@@ -711,6 +822,227 @@ def _build_task_agent_prompt(context: TaskAgentContext) -> str:
         f"Long-term memory:\n{context.memory_snapshot.long_term.to_context() or 'No long-term memory.'}\n\n"
         f"Recent history:\n{_format_messages_for_memory(context.memory_snapshot.short_term)}"
     )
+
+
+def _build_final_planning_json_instructions() -> str:
+    return (
+        "\n\nReturn only JSON with this shape:\n"
+        "{\n"
+        '  "reply": "сообщение пользователю",\n'
+        '  "task": "краткое название задачи",\n'
+        '  "plan": ["шаг 1", "шаг 2"],\n'
+        '  "current": "текущий ближайший шаг",\n'
+        '  "awaiting_confirmation": true,\n'
+        '  "ready_for_execution": false,\n'
+        '  "invariant_check": "как план учитывает инварианты",\n'
+        '  "violates_invariants": false,\n'
+        '  "violated_invariants": []\n'
+        "}\n"
+        "Set ready_for_execution=true only when the user clearly asks to start implementation, "
+        "write code, apply changes, create files/classes/functions, or otherwise perform the artifact work. "
+        "Treat delegation phrases such as 'все на твое усмотрение', 'всё на твоё усмотрение', "
+        "'на ваше усмотрение', 'можешь писать код', 'можете писать код', 'могут писать код', "
+        "'переходи к выполнению', 'можно вносить изменения', 'go ahead', or 'write the code' "
+        "as explicit execution approval. "
+        "Short ambiguous confirmations such as 'давай', 'делай', 'ок', 'окей', or 'согласен' "
+        "are not enough: ask one explicit confirmation question "
+        "that says whether to start execution now. If the user gives explicit execution approval "
+        "and the plan follows all invariants, set ready_for_execution=true instead of repeating the same plan. "
+        "Otherwise ask for confirmation or clarification. "
+        "If the user request or plan violates invariants, set violates_invariants=true, "
+        "ready_for_execution=false, and explain the refusal in reply. "
+        "violated_invariants must contain the exact closest violated invariant bullets, "
+        "including architecture bullets when the conflict is architectural."
+    )
+
+
+def _build_debate_role_prompt(base_prompt: str, role: str) -> str:
+    return (
+        f"{base_prompt}\n\n"
+        "Internal planning debate protocol:\n"
+        "- Answer with compact KQML-like S-expressions only.\n"
+        "- Use at most 5 lines.\n"
+        "- Keep each line short.\n"
+        "- Allowed forms: "
+        "(propose :r ROLE :p POSITION :q QUESTIONS :risk RISKS :plan PLAN :v VIOLATIONS :ready yes|no), "
+        "(block :r ROLE :v VIOLATION :why REASON), "
+        "(ask :r ROLE :q QUESTION).\n"
+        "- Use none when a field is empty.\n"
+        "- Do not return JSON, markdown, code fences, or prose outside forms.\n\n"
+        f"Your role is {role}. Produce your initial planning position."
+    )
+
+
+def _build_debate_review_prompt(base_prompt: str, role: str, transcript: str) -> str:
+    return (
+        f"{base_prompt}\n\n"
+        "Internal planning debate transcript:\n"
+        f"{transcript.strip() or '(empty)'}\n\n"
+        "Respond with compact KQML-like S-expressions only, at most 4 lines.\n"
+        "Allowed forms: "
+        "(accept :r ROLE :target ROLE :why REASON), "
+        "(challenge :r ROLE :target ROLE :p POSITION :risk RISKS :v VIOLATIONS), "
+        "(revise :r ROLE :p POSITION :plan PLAN :ready yes|no), "
+        "(block :r ROLE :v VIOLATION :why REASON).\n"
+        "Use none when a field is empty. Do not return JSON, markdown, code fences, or prose outside forms.\n\n"
+        f"Your role is {role}. Review the other roles and resolve disagreements from your perspective."
+    )
+
+
+def _build_debate_synthesis_prompt(base_prompt: str, notes: list[str]) -> str:
+    transcript = "\n".join(note for note in notes if note.strip())
+    return (
+        f"{base_prompt}\n\n"
+        "Internal compact planning debate notes:\n"
+        f"{transcript.strip() or '(empty)'}\n\n"
+        "Synthesize the debate into the single final planning result. "
+        "Do not expose internal roles, transcript, or protocol unless the user explicitly asks. "
+        "Resolve conflicts conservatively. If any role identifies a real invariant violation, "
+        "the final result must block execution and name the violated invariant. "
+        "If a role failed, use the available notes and the original context.\n"
+        f"{_build_final_planning_json_instructions()}"
+    )
+
+
+def _compact_internal_note(text: str, role: str) -> str:
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    protocol_lines = [line for line in lines if line.startswith("(") and line.endswith(")")]
+    clean_lines = protocol_lines or lines
+    compact = " ".join(clean_lines[:6]).strip()
+    if not compact:
+        return f"(fail :r {role} :err empty)"
+    return compact[:1200]
+
+
+def _planning_result_from_payload(
+    payload: dict[str, object],
+    context: TaskAgentContext,
+    usage: TaskAgentUsage,
+) -> PlanningAgentResult:
+    return PlanningAgentResult(
+        reply=_read_json_string(payload, "reply") or "Уточни требования, и я обновлю план.",
+        task=_read_json_string(payload, "task") or context.memory_snapshot.working.task_state.task,
+        plan=_read_json_string_list(payload, "plan"),
+        current=_read_json_string(payload, "current"),
+        awaiting_confirmation=_read_json_bool(payload, "awaiting_confirmation"),
+        ready_for_execution=_read_json_bool(payload, "ready_for_execution"),
+        invariant_check=_read_json_string(payload, "invariant_check"),
+        violates_invariants=_read_json_bool(payload, "violates_invariants"),
+        violated_invariants=_read_json_string_list(payload, "violated_invariants"),
+        usage=usage,
+    )
+
+
+def _planning_result_has_required_payload(result: PlanningAgentResult) -> bool:
+    if result.violates_invariants:
+        return bool(result.reply and result.violated_invariants)
+    return bool(result.reply and result.task and result.plan)
+
+
+def _apply_explicit_execution_approval(
+    result: PlanningAgentResult,
+    context: TaskAgentContext,
+) -> PlanningAgentResult:
+    if result.violates_invariants or not result.plan:
+        return result
+
+    normalized_user_message = context.user_message.content.lower()
+    if not _has_explicit_execution_approval(normalized_user_message):
+        return result
+
+    return PlanningAgentResult(
+        reply=result.reply,
+        task=result.task,
+        plan=result.plan,
+        current=result.current,
+        awaiting_confirmation=False,
+        ready_for_execution=True,
+        invariant_check=result.invariant_check,
+        violates_invariants=result.violates_invariants,
+        violated_invariants=result.violated_invariants,
+        usage=result.usage,
+    )
+
+
+def _has_explicit_execution_approval(text: str) -> bool:
+    direct_markers = (
+        "можно писать код",
+        "можешь писать код",
+        "можете писать код",
+        "могут писать код",
+        "пиши код",
+        "напиши код",
+        "реализуй",
+        "реализовывай",
+        "сделай реализацию",
+        "делай реализацию",
+        "выполни реализацию",
+        "внеси изменения",
+        "можно вносить",
+        "можешь вносить",
+        "можете вносить",
+        "переходи к выполнению",
+        "переходите к выполнению",
+        "можешь переходить к выполнению",
+        "можете переходить к выполнению",
+        "go ahead",
+        "do it",
+        "proceed",
+        "implement",
+        "start implementation",
+        "write code",
+        "write the code",
+    )
+    if any(marker in text for marker in direct_markers):
+        return True
+
+    discretion_markers = (
+        "на твое усмотрение",
+        "на твоё усмотрение",
+        "на ваше усмотрение",
+        "все на твое усмотрение",
+        "всё на твоё усмотрение",
+        "все на ваше усмотрение",
+        "всё на ваше усмотрение",
+    )
+    execution_words = (
+        "код",
+        "писать",
+        "выполн",
+        "реализ",
+        "изменен",
+        "изменён",
+        "правк",
+    )
+    return any(marker in text for marker in discretion_markers) and any(
+        word in text for word in execution_words
+    )
+
+
+def _add_usage(left: TaskAgentUsage, right: TaskAgentUsage) -> TaskAgentUsage:
+    return TaskAgentUsage(
+        prompt_tokens=left.prompt_tokens + right.prompt_tokens,
+        response_tokens=left.response_tokens + right.response_tokens,
+    )
+
+
+def _with_usage(result: PlanningAgentResult, usage: TaskAgentUsage) -> PlanningAgentResult:
+    return PlanningAgentResult(
+        reply=result.reply,
+        task=result.task,
+        plan=result.plan,
+        current=result.current,
+        awaiting_confirmation=result.awaiting_confirmation,
+        ready_for_execution=result.ready_for_execution,
+        invariant_check=result.invariant_check,
+        violates_invariants=result.violates_invariants,
+        violated_invariants=result.violated_invariants,
+        usage=usage,
+    )
+
+
+def _with_added_usage(result: PlanningAgentResult, usage: TaskAgentUsage) -> PlanningAgentResult:
+    return _with_usage(result, _add_usage(result.usage, usage))
 
 
 def _last_user_and_assistant_text(messages: Sequence[Message]) -> tuple[str, str]:
