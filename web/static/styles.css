@@ -114,18 +114,25 @@ h1 {
   padding: 7px 10px;
 }
 
-.model-badge span {
+.model-badge label {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.1;
 }
 
-.model-badge strong {
+.model-badge select {
   margin-top: 3px;
+  border: 0;
+  background: transparent;
   color: var(--teal);
   font-size: 14px;
+  font-weight: 700;
   line-height: 1.1;
   overflow-wrap: anywhere;
+}
+
+.model-badge select:focus {
+  outline: 0;
 }
 
 .status {
@@ -223,6 +230,13 @@ h1 {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
+}
+
+.message-meta {
+  padding-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.25;
 }
 
 .message.error .message-author {
