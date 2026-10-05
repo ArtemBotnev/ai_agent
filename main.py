@@ -5,13 +5,20 @@ from pathlib import Path
 
 from agent import (
     AVAILABLE_OPENAI_MODELS,
+    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OLLAMA_BASE_URL,
     DEFAULT_OPENAI_MODEL,
+    DEFAULT_SYSTEM_PROMPT,
+    OLLAMA_MODEL_ENV,
+    OLLAMA_MODELS_ENV,
+    OLLAMA_BASE_URL_ENV,
     OPENAI_API_KEY_ENV,
     OPENAI_MODEL_ENV,
     PLANNING_ANALYST_SYSTEM_PROMPT,
     LONG_TERM_MEMORY_SYSTEM_PROMPT,
     DONE_AGENT_SYSTEM_PROMPT,
     DebatingPlanningAgent,
+    OllamaLlmAgent,
     PLANNING_DEVELOPER_SYSTEM_PROMPT,
     PLANNING_DESIGNER_SYSTEM_PROMPT,
     EXECUTION_AGENT_SYSTEM_PROMPT,
@@ -76,6 +83,10 @@ AGENT_USER_ID_ENV = "AGENT_USER_ID"
 AGENT_RECENT_MESSAGES_LIMIT_ENV = "AGENT_RECENT_MESSAGES_LIMIT"
 AGENT_CONTEXT_STRATEGY_ENV = "AGENT_CONTEXT_STRATEGY"
 AGENT_PLANNING_MODE_ENV = "AGENT_PLANNING_MODE"
+AGENT_LLM_PROVIDER_ENV = "AGENT_LLM_PROVIDER"
+LLM_PROVIDER_OPENAI = "openai"
+LLM_PROVIDER_OLLAMA = "ollama"
+LLM_PROVIDERS = (LLM_PROVIDER_OPENAI, LLM_PROVIDER_OLLAMA)
 PLANNING_MODE_SINGLE = "single"
 PLANNING_MODE_DEBATE = "debate"
 PLANNING_MODES = (PLANNING_MODE_SINGLE, PLANNING_MODE_DEBATE)
@@ -93,76 +104,99 @@ AGENT_ERROR_MESSAGES = {
 }
 
 
-def build_agent(model_name: str | None = None) -> SimpleLlmAgent:
-    return SimpleLlmAgent(api_key=get_api_key(), model=get_model_name(model_name))
+def build_llm_agent(
+    model_name: str | None = None,
+    *,
+    provider: str | None = None,
+    system_prompt: str | None = None,
+) -> SimpleLlmAgent | OllamaLlmAgent:
+    selected_provider = get_llm_provider(provider)
+    selected_model_name = get_model_name(model_name, selected_provider)
+    if selected_provider == LLM_PROVIDER_OLLAMA:
+        return OllamaLlmAgent(
+            model=selected_model_name,
+            base_url=get_ollama_base_url(),
+            system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
+        )
 
-
-def build_summarizer(model_name: str | None = None) -> ConversationSummarizer:
-    summary_agent = SimpleLlmAgent(
+    return SimpleLlmAgent(
         api_key=get_api_key(),
-        model=get_model_name(model_name),
+        model=selected_model_name,
+        system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
+    )
+
+
+def build_agent(model_name: str | None = None, provider: str | None = None) -> SimpleLlmAgent | OllamaLlmAgent:
+    return build_llm_agent(model_name, provider=provider)
+
+
+def build_summarizer(model_name: str | None = None, provider: str | None = None) -> ConversationSummarizer:
+    summary_agent = build_llm_agent(
+        model_name,
+        provider=provider,
         system_prompt=SUMMARY_SYSTEM_PROMPT,
     )
     return SimpleConversationSummarizer(summary_agent)
 
 
-def build_facts_extractor(model_name: str | None = None) -> StickyFactsExtractor:
-    facts_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=get_model_name(model_name),
+def build_facts_extractor(model_name: str | None = None, provider: str | None = None) -> StickyFactsExtractor:
+    facts_agent = build_llm_agent(
+        model_name,
+        provider=provider,
         system_prompt=STICKY_FACTS_SYSTEM_PROMPT,
     )
     return SimpleStickyFactsExtractor(facts_agent)
 
 
-def build_working_memory_extractor(model_name: str | None = None) -> WorkingMemoryExtractor:
-    working_memory_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=get_model_name(model_name),
+def build_working_memory_extractor(model_name: str | None = None, provider: str | None = None) -> WorkingMemoryExtractor:
+    working_memory_agent = build_llm_agent(
+        model_name,
+        provider=provider,
         system_prompt=WORKING_MEMORY_SYSTEM_PROMPT,
     )
     return SimpleWorkingMemoryExtractor(working_memory_agent)
 
 
-def build_long_term_memory_extractor(model_name: str | None = None) -> LongTermMemoryExtractor:
-    long_term_memory_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=get_model_name(model_name),
+def build_long_term_memory_extractor(model_name: str | None = None, provider: str | None = None) -> LongTermMemoryExtractor:
+    long_term_memory_agent = build_llm_agent(
+        model_name,
+        provider=provider,
         system_prompt=LONG_TERM_MEMORY_SYSTEM_PROMPT,
     )
     return SimpleLongTermMemoryExtractor(long_term_memory_agent)
 
 
-def build_planning_agent(model_name: str | None = None) -> PlanningAgent:
-    selected_model_name = get_model_name(model_name)
+def build_planning_agent(model_name: str | None = None, provider: str | None = None) -> PlanningAgent:
+    selected_provider = get_llm_provider(provider)
+    selected_model_name = get_model_name(model_name, selected_provider)
     single_planning_agent = SimplePlanningAgent(
-        SimpleLlmAgent(
-            api_key=get_api_key(),
-            model=selected_model_name,
+        build_llm_agent(
+            selected_model_name,
+            provider=selected_provider,
             system_prompt=PLANNING_AGENT_SYSTEM_PROMPT,
         )
     )
     if get_planning_mode() == PLANNING_MODE_SINGLE:
         return single_planning_agent
 
-    analyst_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=selected_model_name,
+    analyst_agent = build_llm_agent(
+        selected_model_name,
+        provider=selected_provider,
         system_prompt=PLANNING_ANALYST_SYSTEM_PROMPT,
     )
-    developer_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=selected_model_name,
+    developer_agent = build_llm_agent(
+        selected_model_name,
+        provider=selected_provider,
         system_prompt=PLANNING_DEVELOPER_SYSTEM_PROMPT,
     )
-    designer_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=selected_model_name,
+    designer_agent = build_llm_agent(
+        selected_model_name,
+        provider=selected_provider,
         system_prompt=PLANNING_DESIGNER_SYSTEM_PROMPT,
     )
-    synthesizer_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=selected_model_name,
+    synthesizer_agent = build_llm_agent(
+        selected_model_name,
+        provider=selected_provider,
         system_prompt=PLANNING_SYNTHESIZER_SYSTEM_PROMPT,
     )
     return DebatingPlanningAgent(
@@ -174,28 +208,28 @@ def build_planning_agent(model_name: str | None = None) -> PlanningAgent:
     )
 
 
-def build_execution_agent(model_name: str | None = None) -> ExecutionAgent:
-    execution_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=get_model_name(model_name),
+def build_execution_agent(model_name: str | None = None, provider: str | None = None) -> ExecutionAgent:
+    execution_agent = build_llm_agent(
+        model_name,
+        provider=provider,
         system_prompt=EXECUTION_AGENT_SYSTEM_PROMPT,
     )
     return SimpleExecutionAgent(execution_agent)
 
 
-def build_validation_agent(model_name: str | None = None) -> ValidationAgent:
-    validation_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=get_model_name(model_name),
+def build_validation_agent(model_name: str | None = None, provider: str | None = None) -> ValidationAgent:
+    validation_agent = build_llm_agent(
+        model_name,
+        provider=provider,
         system_prompt=VALIDATION_AGENT_SYSTEM_PROMPT,
     )
     return SimpleValidationAgent(validation_agent)
 
 
-def build_done_agent(model_name: str | None = None) -> DoneAgent:
-    done_agent = SimpleLlmAgent(
-        api_key=get_api_key(),
-        model=get_model_name(model_name),
+def build_done_agent(model_name: str | None = None, provider: str | None = None) -> DoneAgent:
+    done_agent = build_llm_agent(
+        model_name,
+        provider=provider,
         system_prompt=DONE_AGENT_SYSTEM_PROMPT,
     )
     return SimpleDoneAgent(done_agent)
@@ -209,17 +243,52 @@ def get_api_key() -> str:
     return api_key
 
 
-def get_available_model_names() -> list[str]:
+def get_llm_provider(provider: str | None = None) -> str:
+    selected_provider = (provider or os.getenv(AGENT_LLM_PROVIDER_ENV, LLM_PROVIDER_OPENAI)).strip().lower()
+    if selected_provider not in LLM_PROVIDERS:
+        available_providers = ", ".join(LLM_PROVIDERS)
+        raise RuntimeError(f"Переменная {AGENT_LLM_PROVIDER_ENV} должна быть одной из: {available_providers}.")
+
+    return selected_provider
+
+
+def get_ollama_base_url() -> str:
+    base_url = os.getenv(OLLAMA_BASE_URL_ENV, DEFAULT_OLLAMA_BASE_URL).strip()
+    if not base_url:
+        raise RuntimeError(f"Переменная {OLLAMA_BASE_URL_ENV} не должна быть пустой.")
+
+    return base_url
+
+
+def get_available_model_names(provider: str | None = None) -> list[str]:
+    selected_provider = get_llm_provider(provider)
+    if selected_provider == LLM_PROVIDER_OLLAMA:
+        raw_models = os.getenv(OLLAMA_MODELS_ENV, "").strip()
+        model_names = [model.strip() for model in raw_models.split(",") if model.strip()]
+        selected_model = os.getenv(OLLAMA_MODEL_ENV, "").strip()
+        if selected_model and selected_model not in model_names:
+            model_names.insert(0, selected_model)
+
+        return model_names or [DEFAULT_OLLAMA_MODEL]
+
     return list(AVAILABLE_OPENAI_MODELS)
 
 
-def get_model_name(model_name: str | None = None) -> str:
-    selected_model = (model_name or os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL)).strip()
+def get_model_name(model_name: str | None = None, provider: str | None = None) -> str:
+    selected_provider = get_llm_provider(provider)
+    available_model_names = get_available_model_names(selected_provider)
+    default_model = (
+        os.getenv(OLLAMA_MODEL_ENV, available_model_names[0])
+        if selected_provider == LLM_PROVIDER_OLLAMA
+        else os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL)
+    )
+    selected_model = (model_name or default_model).strip()
     if not selected_model:
-        raise RuntimeError(f"Переменная {OPENAI_MODEL_ENV} не должна быть пустой.")
+        model_env = OLLAMA_MODEL_ENV if selected_provider == LLM_PROVIDER_OLLAMA else OPENAI_MODEL_ENV
+        raise RuntimeError(f"Переменная {model_env} не должна быть пустой.")
 
-    if selected_model not in AVAILABLE_OPENAI_MODELS:
-        available_models = ", ".join(get_available_model_names())
+    if selected_model not in available_model_names:
+        available_models = ", ".join(available_model_names)
         raise RuntimeError(f"Модель должна быть одной из: {available_models}.")
 
     return selected_model
@@ -348,8 +417,14 @@ def get_recent_messages_limit() -> int:
     return limit
 
 
-def get_context_strategy() -> ContextStrategy:
-    raw_strategy = os.getenv(AGENT_CONTEXT_STRATEGY_ENV, ContextStrategy.MEMORY.value)
+def get_context_strategy(provider: str | None = None) -> ContextStrategy:
+    if AGENT_CONTEXT_STRATEGY_ENV in os.environ:
+        raw_strategy = os.getenv(AGENT_CONTEXT_STRATEGY_ENV, ContextStrategy.MEMORY.value)
+    elif get_llm_provider(provider) == LLM_PROVIDER_OLLAMA:
+        raw_strategy = ContextStrategy.SUMMARY.value
+    else:
+        raw_strategy = ContextStrategy.MEMORY.value
+
     try:
         return ContextStrategy.from_value(raw_strategy)
     except ValueError as error:
@@ -373,30 +448,33 @@ def build_chat_service(
     model_name: str | None = None,
     user_id: str | None = None,
     on_task_stage_changed: Callable[[WorkingMemory], None] | None = None,
+    provider: str | None = None,
 ) -> ChatService:
-    selected_model_name = get_model_name(model_name)
+    selected_provider = get_llm_provider(provider)
+    selected_model_name = get_model_name(model_name, selected_provider)
     selected_user_id = get_user_id(user_id)
+    selected_context_strategy = context_strategy or get_context_strategy(selected_provider)
     return ChatService(
-        agent=build_agent(selected_model_name),
+        agent=build_agent(selected_model_name, selected_provider),
         history_repository=build_history_repository(selected_user_id),
         summary_repository=build_summary_repository(),
-        summarizer=build_summarizer(selected_model_name),
+        summarizer=build_summarizer(selected_model_name, selected_provider),
         facts_repository=build_facts_repository(),
-        facts_extractor=build_facts_extractor(selected_model_name),
+        facts_extractor=build_facts_extractor(selected_model_name, selected_provider),
         branch_repository=build_branch_repository(),
         working_memory_repository=build_working_memory_repository(selected_user_id),
-        working_memory_extractor=build_working_memory_extractor(selected_model_name),
+        working_memory_extractor=build_working_memory_extractor(selected_model_name, selected_provider),
         long_term_memory_repository=build_long_term_memory_repository(selected_user_id),
-        long_term_memory_extractor=build_long_term_memory_extractor(selected_model_name),
+        long_term_memory_extractor=build_long_term_memory_extractor(selected_model_name, selected_provider),
         user_profile_repository=build_user_profile_repository(selected_user_id),
         invariants_repository=build_invariants_repository(selected_user_id),
         recent_messages_limit=get_recent_messages_limit(),
-        context_strategy=context_strategy or get_context_strategy(),
+        context_strategy=selected_context_strategy,
         on_task_stage_changed=on_task_stage_changed,
-        planning_agent=build_planning_agent(selected_model_name),
-        execution_agent=build_execution_agent(selected_model_name),
-        validation_agent=build_validation_agent(selected_model_name),
-        done_agent=build_done_agent(selected_model_name),
+        planning_agent=build_planning_agent(selected_model_name, selected_provider),
+        execution_agent=build_execution_agent(selected_model_name, selected_provider),
+        validation_agent=build_validation_agent(selected_model_name, selected_provider),
+        done_agent=build_done_agent(selected_model_name, selected_provider),
     )
 
 
@@ -418,7 +496,7 @@ def format_agent_error(error: AgentError) -> str:
 def run_chat(chat_service: ChatService) -> None:
     print("Простой CLI-чат с LLM-агентом")
     print("Введите сообщение и нажмите Enter. Для выхода напишите 'exit' или 'quit'.")
-    print("Команды: /model, /strategy, /clear, /branch, /checkpoint, /new-branch <name>.")
+    print("Команды: /provider, /model, /strategy, /clear, /branch, /checkpoint, /new-branch <name>.")
 
     while True:
         try:
@@ -462,6 +540,9 @@ def handle_command(chat_service: ChatService, command: str) -> ChatService:
     if command_name == "/model":
         return handle_model_command(chat_service, command_argument)
 
+    if command_name == "/provider":
+        return handle_provider_command(chat_service, command_argument)
+
     if command_name == "/strategy":
         handle_strategy_command(chat_service, command_argument)
         return chat_service
@@ -502,14 +583,16 @@ def handle_command(chat_service: ChatService, command: str) -> ChatService:
 
 
 def handle_model_command(chat_service: ChatService, argument: str) -> ChatService:
+    provider = get_chat_service_provider(chat_service)
     if not argument:
-        models = ", ".join(get_available_model_names())
+        models = ", ".join(get_available_model_names(provider))
         print(f"Текущая модель: {chat_service.get_model_name()}.")
+        print(f"Текущий provider: {provider}.")
         print(f"Доступные модели: {models}.")
         return chat_service
 
     try:
-        model_name = get_model_name(argument)
+        model_name = get_model_name(argument, provider)
     except RuntimeError as error:
         print(f"Ошибка модели: {error}")
         return chat_service
@@ -517,9 +600,47 @@ def handle_model_command(chat_service: ChatService, argument: str) -> ChatServic
     updated_chat_service = build_chat_service(
         context_strategy=chat_service.get_context_strategy(),
         model_name=model_name,
+        provider=provider,
     )
     print(f"Модель переключена на {model_name}.")
     return updated_chat_service
+
+
+def handle_provider_command(chat_service: ChatService, argument: str) -> ChatService:
+    if not argument:
+        providers = ", ".join(LLM_PROVIDERS)
+        print(f"Текущий provider: {get_chat_service_provider(chat_service)}.")
+        print(f"Доступные provider: {providers}.")
+        return chat_service
+
+    try:
+        provider = get_llm_provider(argument)
+        model_name = get_model_name(provider=provider)
+    except RuntimeError as error:
+        print(f"Ошибка provider: {error}")
+        return chat_service
+
+    context_strategy = chat_service.get_context_strategy()
+    if provider == LLM_PROVIDER_OLLAMA and AGENT_CONTEXT_STRATEGY_ENV not in os.environ:
+        context_strategy = ContextStrategy.SUMMARY
+
+    updated_chat_service = build_chat_service(
+        context_strategy=context_strategy,
+        model_name=model_name,
+        provider=provider,
+    )
+    print(f"Provider переключен на {provider}. Модель: {model_name}.")
+    if provider == LLM_PROVIDER_OLLAMA:
+        print(f"Ollama URL: {get_ollama_base_url()}.")
+    return updated_chat_service
+
+
+def get_chat_service_provider(chat_service: ChatService) -> str:
+    agent = getattr(chat_service, "_agent", None)
+    if isinstance(agent, OllamaLlmAgent):
+        return LLM_PROVIDER_OLLAMA
+
+    return LLM_PROVIDER_OPENAI
 
 
 def handle_strategy_command(chat_service: ChatService, argument: str) -> None:

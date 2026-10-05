@@ -27,7 +27,12 @@ from domain.working_memory import WorkingMemory
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_MODEL_ENV = "OPENAI_MODEL"
+OLLAMA_BASE_URL_ENV = "AGENT_OLLAMA_URL"
+OLLAMA_MODEL_ENV = "AGENT_OLLAMA_MODEL"
+OLLAMA_MODELS_ENV = "AGENT_OLLAMA_MODELS"
 DEFAULT_OPENAI_MODEL = "gpt-3.5-turbo-0125"
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_MODEL = "llama3.1:8b"
 AVAILABLE_OPENAI_MODELS = (
     DEFAULT_OPENAI_MODEL,
     "gpt-4o-mini",
@@ -287,6 +292,117 @@ class SimpleLlmAgent:
                     text_parts.append(text.strip())
 
         return text_parts
+
+
+@dataclass
+class OllamaLlmAgent:
+    model: str = DEFAULT_OLLAMA_MODEL
+    base_url: str = DEFAULT_OLLAMA_BASE_URL
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    on_event: AgentEventCallback | None = None
+
+    def count_tokens(self, messages: Sequence[Message], *, context: str = "") -> int:
+        return 0
+
+    def ask(self, messages: Sequence[Message], *, context: str = "") -> LlmAnswer:
+        if not messages:
+            raise AgentError(AgentErrorCode.EMPTY_MESSAGE)
+
+        payload = {
+            "model": self.model,
+            "messages": self._build_messages(messages, context),
+            "stream": False,
+        }
+
+        self._emit(AgentEvent.REQUEST_STARTED)
+        try:
+            response_data = self._post_json(payload, self._chat_url())
+            return LlmAnswer(
+                text=self._extract_text(response_data),
+                response_tokens=self._extract_eval_count(response_data),
+            )
+        finally:
+            self._emit(AgentEvent.REQUEST_FINISHED)
+
+    def _build_messages(self, messages: Sequence[Message], context: str = "") -> list[dict[str, str]]:
+        chat_messages = [
+            {
+                "role": "system",
+                "content": self._build_instructions(context),
+            }
+        ]
+        chat_messages.extend(message.to_dict() for message in messages)
+        return chat_messages
+
+    def _build_instructions(self, context: str = "") -> str:
+        clean_context = context.strip()
+        if not clean_context:
+            return self.system_prompt
+
+        return f"{self.system_prompt}\n\n{ADDITIONAL_CONTEXT_LABEL}\n{clean_context}"
+
+    def _chat_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/api/chat"
+
+    def _post_json(self, payload: dict[str, Any], api_url: str) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        request = Request(
+            api_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urlopen(request, timeout=120) as response:
+                raw_body = response.read().decode("utf-8")
+        except HTTPError as error:
+            details = error.read().decode("utf-8", errors="replace")
+            raise AgentError(
+                AgentErrorCode.HTTP_ERROR,
+                details=details,
+                status_code=error.code,
+            ) from error
+        except URLError as error:
+            raise AgentError(
+                AgentErrorCode.CONNECTION_ERROR,
+                details=str(error.reason),
+            ) from error
+        except TimeoutError as error:
+            raise AgentError(AgentErrorCode.TIMEOUT) from error
+
+        try:
+            return json.loads(raw_body)
+        except json.JSONDecodeError as error:
+            raise AgentError(AgentErrorCode.INVALID_JSON) from error
+
+    def _extract_text(self, response_data: dict[str, Any]) -> str:
+        message = response_data.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+
+        response = response_data.get("response")
+        if isinstance(response, str) and response.strip():
+            return response.strip()
+
+        done = response_data.get("done")
+        if done is False:
+            raise AgentError(AgentErrorCode.INCOMPLETE_RESPONSE)
+
+        raise AgentError(AgentErrorCode.MISSING_OUTPUT_TEXT)
+
+    def _extract_eval_count(self, response_data: dict[str, Any]) -> int:
+        eval_count = response_data.get("eval_count")
+        if isinstance(eval_count, int) and eval_count >= 0:
+            return eval_count
+
+        return 0
+
+    def _emit(self, event: AgentEvent) -> None:
+        if self.on_event is not None:
+            self.on_event(event)
 
 
 @dataclass

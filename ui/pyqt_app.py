@@ -1,4 +1,5 @@
 import html
+import os
 import sys
 from typing import Any
 
@@ -14,12 +15,16 @@ from domain.task_state import TASK_STATE_MARKERS
 from domain.working_memory import WorkingMemory
 from main import build_chat_service, build_history_repository, format_agent_error, get_context_strategy
 from main import (
+    AGENT_CONTEXT_STRATEGY_ENV,
     build_branch_repository,
     build_facts_repository,
+    get_llm_provider,
     get_available_model_names,
     get_available_user_ids,
     get_model_name,
     get_user_id,
+    LLM_PROVIDER_OLLAMA,
+    LLM_PROVIDERS,
     build_long_term_memory_repository,
     build_summary_repository,
     build_working_memory_repository,
@@ -83,12 +88,14 @@ def main() -> None:
             context_strategy: ContextStrategy,
             model_name: str,
             user_id: str,
+            provider: str,
         ) -> None:
             super().__init__()
             self._message = message
             self._context_strategy = context_strategy
             self._model_name = model_name
             self._user_id = user_id
+            self._provider = provider
 
         def run(self) -> None:
             try:
@@ -97,6 +104,7 @@ def main() -> None:
                     self._model_name,
                     self._user_id,
                     self.task_stage_changed.emit,
+                    self._provider,
                 ).answer(self._message)
             except RuntimeError as error:
                 self.failed.emit(str(error))
@@ -116,6 +124,7 @@ def main() -> None:
 
             self._user_label = QLabel("Пользователь:")
             self._user_combo = QComboBox()
+            self._provider_combo = QComboBox()
             self._model_combo = QComboBox()
             self._status_label = QLabel("Готов")
             self._task_state_label = QLabel()
@@ -153,22 +162,25 @@ def main() -> None:
             self._user_label.setVisible(show_user_selector)
             self._user_combo.setVisible(show_user_selector)
 
+            for provider in LLM_PROVIDERS:
+                self._provider_combo.addItem(provider, provider)
+            provider_index = self._provider_combo.findData(get_llm_provider())
+            if provider_index >= 0:
+                self._provider_combo.setCurrentIndex(provider_index)
+
             for strategy in ContextStrategy:
                 self._strategy_combo.addItem(strategy.display_name, strategy.value)
-            strategy_index = self._strategy_combo.findData(get_context_strategy().value)
+            strategy_index = self._strategy_combo.findData(get_context_strategy(self._selected_provider()).value)
             if strategy_index >= 0:
                 self._strategy_combo.setCurrentIndex(strategy_index)
 
-            for model_name in get_available_model_names():
-                self._model_combo.addItem(model_name, model_name)
-            model_index = self._model_combo.findData(get_model_name())
-            if model_index >= 0:
-                self._model_combo.setCurrentIndex(model_index)
+            self._refresh_model_combo()
 
             self._input.submit_requested.connect(self._send_message)
             self._send_button.clicked.connect(self._send_message)
             self._clear_button.clicked.connect(self._clear_context)
             self._user_combo.currentIndexChanged.connect(self._handle_user_changed)
+            self._provider_combo.currentIndexChanged.connect(self._handle_provider_changed)
             self._strategy_combo.currentIndexChanged.connect(self._handle_strategy_changed)
             self._branch_combo.currentIndexChanged.connect(self._handle_branch_changed)
             self._checkpoint_button.clicked.connect(self._save_checkpoint)
@@ -179,6 +191,9 @@ def main() -> None:
                 header_layout.addWidget(self._user_label)
                 header_layout.addWidget(self._user_combo)
                 header_layout.addSpacing(16)
+            header_layout.addWidget(QLabel("Provider:"))
+            header_layout.addWidget(self._provider_combo)
+            header_layout.addSpacing(16)
             header_layout.addWidget(QLabel("Модель:"))
             header_layout.addWidget(self._model_combo)
             header_layout.addSpacing(16)
@@ -242,6 +257,7 @@ def main() -> None:
                 self._selected_strategy(),
                 self._selected_model_name(),
                 self._selected_user_id(),
+                self._selected_provider(),
             )
             self._worker.answered.connect(self._handle_answer)
             self._worker.failed.connect(self._handle_error)
@@ -276,6 +292,7 @@ def main() -> None:
             self._send_button.setDisabled(is_loading)
             self._input.setDisabled(is_loading)
             self._user_combo.setDisabled(is_loading)
+            self._provider_combo.setDisabled(is_loading)
             self._model_combo.setDisabled(is_loading)
             self._strategy_combo.setDisabled(is_loading)
             self._branch_combo.setDisabled(is_loading)
@@ -313,7 +330,14 @@ def main() -> None:
             if isinstance(model_name, str):
                 return model_name
 
-            return get_model_name()
+            return get_model_name(provider=self._selected_provider())
+
+        def _selected_provider(self) -> str:
+            provider = self._provider_combo.currentData()
+            if isinstance(provider, str):
+                return provider
+
+            return get_llm_provider()
 
         def _selected_user_id(self) -> str:
             user_id = self._user_combo.currentData()
@@ -337,6 +361,24 @@ def main() -> None:
             self._update_branch_controls()
             self._update_task_state()
             self._load_history()
+
+        def _handle_provider_changed(self, *_args: Any) -> None:
+            self._refresh_model_combo()
+            if self._selected_provider() == LLM_PROVIDER_OLLAMA and AGENT_CONTEXT_STRATEGY_ENV not in os.environ:
+                strategy_index = self._strategy_combo.findData(ContextStrategy.SUMMARY.value)
+                if strategy_index >= 0:
+                    self._strategy_combo.setCurrentIndex(strategy_index)
+            self._update_branch_controls()
+            self._update_task_state()
+
+        def _refresh_model_combo(self) -> None:
+            provider = self._selected_provider()
+            self._model_combo.clear()
+            for model_name in get_available_model_names(provider):
+                self._model_combo.addItem(model_name, model_name)
+            model_index = self._model_combo.findData(get_model_name(provider=provider))
+            if model_index >= 0:
+                self._model_combo.setCurrentIndex(model_index)
 
         def _update_branch_controls(self) -> None:
             is_branching = self._selected_strategy() == ContextStrategy.BRANCHING
