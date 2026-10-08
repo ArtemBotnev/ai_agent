@@ -105,6 +105,7 @@ class WebChatHandler(BaseHTTPRequestHandler):
                     "history": response.tokens.history,
                     "response": response.tokens.response,
                 },
+                "duration_seconds": response.duration_seconds,
             },
             HTTPStatus.OK,
         )

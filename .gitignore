@@ -6,3 +6,8 @@ __pycache__/
 /memory
 /profiles/users/
 /invariants/users/
+/agent_config/profiles/users/
+/agent_config/invariants/users/
+/agent_config/prompts/*
+!/agent_config/prompts/example/
+!/agent_config/prompts/example/**

@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+import time
 
 from application.branches.branch_repository import BranchRepository
 from application.chat.agent_error import AgentError, AgentErrorCode
@@ -50,6 +51,7 @@ class ChatTokenUsage:
 class ChatResponse:
     text: str
     tokens: ChatTokenUsage
+    duration_seconds: float = 0.0
 
 
 class ChatService:
@@ -242,6 +244,7 @@ class ChatService:
                 history=history_tokens,
                 response=answer.response_tokens,
             ),
+            duration_seconds=answer.duration_seconds,
         )
 
     def _answer_with_sliding_window(self, current_message: Message) -> ChatResponse:
@@ -265,6 +268,7 @@ class ChatService:
                 history=history_tokens,
                 response=answer.response_tokens,
             ),
+            duration_seconds=answer.duration_seconds,
         )
 
     def _answer_with_sticky_facts(self, current_message: Message) -> ChatResponse:
@@ -291,6 +295,7 @@ class ChatService:
                 history=history_tokens,
                 response=answer.response_tokens,
             ),
+            duration_seconds=answer.duration_seconds,
         )
 
     def _answer_with_branching(self, current_message: Message) -> ChatResponse:
@@ -324,6 +329,7 @@ class ChatService:
                 history=history_tokens,
                 response=answer.response_tokens,
             ),
+            duration_seconds=answer.duration_seconds,
         )
 
     def _answer_with_memory(self, current_message: Message) -> ChatResponse:
@@ -353,6 +359,7 @@ class ChatService:
             self._notify_task_stage_changed(working_memory)
 
         current_request_tokens = self._agent.count_tokens([current_message])
+        started_at = time.monotonic()
         history_tokens = 0
         response_tokens = 0
         final_answer = ""
@@ -496,6 +503,7 @@ class ChatService:
                 history=history_tokens,
                 response=response_tokens,
             ),
+            duration_seconds=time.monotonic() - started_at,
         )
 
     def _format_validation_failure(self, reply: str, issues: list[str]) -> str:

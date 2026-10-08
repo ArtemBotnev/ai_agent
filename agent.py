@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Sequence
@@ -178,11 +179,13 @@ class SimpleLlmAgent:
         }
 
         self._emit(AgentEvent.REQUEST_STARTED)
+        started_at = time.monotonic()
         try:
             response_data = self._post_json(payload, self.api_url)
             return LlmAnswer(
                 text=self._extract_text(response_data),
                 response_tokens=self._extract_output_tokens(response_data),
+                duration_seconds=time.monotonic() - started_at,
             )
         finally:
             self._emit(AgentEvent.REQUEST_FINISHED)
@@ -295,10 +298,37 @@ class SimpleLlmAgent:
 
 
 @dataclass
+class OllamaOptions:
+    temperature: float | None = None
+    num_predict: int | None = None
+    num_ctx: int | None = None
+    top_k: int | None = None
+    top_p: float | None = None
+    repeat_penalty: float | None = None
+    seed: int | None = None
+
+    def to_payload(self) -> dict[str, int | float]:
+        return {
+            key: value
+            for key, value in {
+                "temperature": self.temperature,
+                "num_predict": self.num_predict,
+                "num_ctx": self.num_ctx,
+                "top_k": self.top_k,
+                "top_p": self.top_p,
+                "repeat_penalty": self.repeat_penalty,
+                "seed": self.seed,
+            }.items()
+            if value is not None
+        }
+
+
+@dataclass
 class OllamaLlmAgent:
     model: str = DEFAULT_OLLAMA_MODEL
     base_url: str = DEFAULT_OLLAMA_BASE_URL
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    options: OllamaOptions | None = None
     on_event: AgentEventCallback | None = None
 
     def count_tokens(self, messages: Sequence[Message], *, context: str = "") -> int:
@@ -313,13 +343,19 @@ class OllamaLlmAgent:
             "messages": self._build_messages(messages, context),
             "stream": False,
         }
+        if self.options is not None:
+            options_payload = self.options.to_payload()
+            if options_payload:
+                payload["options"] = options_payload
 
         self._emit(AgentEvent.REQUEST_STARTED)
+        started_at = time.monotonic()
         try:
             response_data = self._post_json(payload, self._chat_url())
             return LlmAnswer(
                 text=self._extract_text(response_data),
                 response_tokens=self._extract_eval_count(response_data),
+                duration_seconds=self._extract_total_duration_seconds(response_data, started_at),
             )
         finally:
             self._emit(AgentEvent.REQUEST_FINISHED)
@@ -399,6 +435,13 @@ class OllamaLlmAgent:
             return eval_count
 
         return 0
+
+    def _extract_total_duration_seconds(self, response_data: dict[str, Any], started_at: float) -> float:
+        total_duration = response_data.get("total_duration")
+        if isinstance(total_duration, int) and total_duration >= 0:
+            return total_duration / 1_000_000_000
+
+        return time.monotonic() - started_at
 
     def _emit(self, event: AgentEvent) -> None:
         if self.on_event is not None:

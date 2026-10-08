@@ -1,7 +1,12 @@
 import html
 import os
+import shutil
+import subprocess
 import sys
+import time
 from typing import Any
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from application.chat.agent_error import AgentError
 from application.chat.chat_service import ChatResponse
@@ -18,6 +23,7 @@ from main import (
     AGENT_CONTEXT_STRATEGY_ENV,
     build_branch_repository,
     build_facts_repository,
+    get_ollama_base_url,
     get_llm_provider,
     get_available_model_names,
     get_available_user_ids,
@@ -113,10 +119,114 @@ def main() -> None:
             else:
                 self.answered.emit(response)
 
+    class OllamaWorker(QThread):
+        progress = pyqtSignal(str)
+        completed = pyqtSignal(str, object)
+        failed = pyqtSignal(str)
+
+        def __init__(self, base_url: str, model_name: str) -> None:
+            super().__init__()
+            self._base_url = base_url.rstrip("/")
+            self._model_name = model_name
+
+        def run(self) -> None:
+            if shutil.which("ollama") is None:
+                self.failed.emit("Команда ollama не найдена в PATH.")
+                return
+
+            ollama_process = None
+            if self._is_ready():
+                self.progress.emit(f"Ollama уже запущен: {self._base_url}")
+            else:
+                self.progress.emit(f"Запуск Ollama: {self._base_url}")
+                try:
+                    ollama_process = self._start_server()
+                    self._wait_until_ready()
+                except (OSError, TimeoutError) as error:
+                    if ollama_process is not None:
+                        ollama_process.terminate()
+                    self.failed.emit(f"Не удалось запустить Ollama: {error}")
+                    return
+
+            try:
+                if self._has_model():
+                    self.completed.emit(f"Модель уже доступна: {self._model_name}", ollama_process)
+                    return
+
+                self.progress.emit(f"Загрузка модели: {self._model_name}")
+                self._pull_model()
+            except RuntimeError as error:
+                if ollama_process is not None:
+                    ollama_process.terminate()
+                self.failed.emit(str(error))
+                return
+
+            self.completed.emit(f"Ollama готов. Модель: {self._model_name}", ollama_process)
+
+        def _start_server(self) -> subprocess.Popen[Any]:
+            env = os.environ.copy()
+            env["OLLAMA_HOST"] = self._host_for_env()
+            return subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+
+        def _host_for_env(self) -> str:
+            host = self._base_url.removeprefix("http://").removeprefix("https://")
+            return host.rstrip("/")
+
+        def _wait_until_ready(self) -> None:
+            for _ in range(30):
+                if self._is_ready():
+                    return
+                time.sleep(1)
+
+            raise TimeoutError("сервер не ответил за 30 секунд")
+
+        def _is_ready(self) -> bool:
+            try:
+                with urlopen(f"{self._base_url}/api/tags", timeout=2) as response:
+                    return 200 <= response.status < 300
+            except (OSError, URLError, TimeoutError):
+                return False
+
+        def _has_model(self) -> bool:
+            result = subprocess.run(
+                ["ollama", "list"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                details = (result.stderr or result.stdout).strip()
+                raise RuntimeError(f"Не удалось получить список моделей Ollama. {details}".strip())
+
+            for line in result.stdout.splitlines()[1:]:
+                columns = line.split()
+                if columns and columns[0] == self._model_name:
+                    return True
+
+            return False
+
+        def _pull_model(self) -> None:
+            result = subprocess.run(
+                ["ollama", "pull", self._model_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                details = (result.stderr or result.stdout).strip()
+                raise RuntimeError(f"Не удалось загрузить модель {self._model_name}. {details}".strip())
+
     class ChatWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
             self._worker: ChatWorker | None = None
+            self._ollama_worker: OllamaWorker | None = None
+            self._ollama_process: subprocess.Popen[Any] | None = None
             self._is_loading_branches = False
 
             self.setWindowTitle("LLM Агент")
@@ -130,6 +240,7 @@ def main() -> None:
             self._task_state_label = QLabel()
             self._strategy_combo = QComboBox()
             self._branch_combo = QComboBox()
+            self._ollama_button = QPushButton("Запустить Ollama")
             self._checkpoint_button = QPushButton("Checkpoint")
             self._new_branch_button = QPushButton("Новая ветка")
             self._clear_button = QPushButton("Очистить")
@@ -149,6 +260,7 @@ def main() -> None:
             self._send_button.setFixedHeight(COMPOSER_HEIGHT)
             self._send_button.setFixedWidth(140)
             self._clear_button.setFixedHeight(36)
+            self._ollama_button.setFixedHeight(36)
             self._checkpoint_button.setFixedHeight(36)
             self._new_branch_button.setFixedHeight(36)
 
@@ -183,6 +295,7 @@ def main() -> None:
             self._provider_combo.currentIndexChanged.connect(self._handle_provider_changed)
             self._strategy_combo.currentIndexChanged.connect(self._handle_strategy_changed)
             self._branch_combo.currentIndexChanged.connect(self._handle_branch_changed)
+            self._ollama_button.clicked.connect(self._start_ollama)
             self._checkpoint_button.clicked.connect(self._save_checkpoint)
             self._new_branch_button.clicked.connect(self._create_branch)
 
@@ -196,6 +309,7 @@ def main() -> None:
             header_layout.addSpacing(16)
             header_layout.addWidget(QLabel("Модель:"))
             header_layout.addWidget(self._model_combo)
+            header_layout.addWidget(self._ollama_button)
             header_layout.addSpacing(16)
             header_layout.addWidget(QLabel("Стратегия:"))
             header_layout.addWidget(self._strategy_combo)
@@ -220,6 +334,7 @@ def main() -> None:
             root.setLayout(root_layout)
             self.setCentralWidget(root)
             self.setStyleSheet(WINDOW_STYLESHEET)
+            self._update_ollama_controls()
             self._update_branch_controls()
             self._update_task_state()
 
@@ -274,7 +389,8 @@ def main() -> None:
             tokens = chat_response.tokens
             meta = (
                 f"Токены: запрос {tokens.current_request}, "
-                f"история {tokens.history}, ответ {tokens.response}"
+                f"история {tokens.history}, ответ {tokens.response}; "
+                f"время {chat_response.duration_seconds:.2f} с"
             )
             self._append_message(AGENT_AUTHOR, chat_response.text, meta)
             self._update_task_state()
@@ -294,6 +410,7 @@ def main() -> None:
             self._user_combo.setDisabled(is_loading)
             self._provider_combo.setDisabled(is_loading)
             self._model_combo.setDisabled(is_loading)
+            self._ollama_button.setDisabled(is_loading or self._selected_provider() != LLM_PROVIDER_OLLAMA)
             self._strategy_combo.setDisabled(is_loading)
             self._branch_combo.setDisabled(is_loading)
             self._checkpoint_button.setDisabled(is_loading)
@@ -301,6 +418,7 @@ def main() -> None:
             self._clear_button.setDisabled(is_loading)
             self._status_label.setText("Запрос..." if is_loading else "Готов")
             if not is_loading:
+                self._update_ollama_controls()
                 self._update_branch_controls()
                 self._update_task_state()
 
@@ -368,6 +486,7 @@ def main() -> None:
                 strategy_index = self._strategy_combo.findData(ContextStrategy.SUMMARY.value)
                 if strategy_index >= 0:
                     self._strategy_combo.setCurrentIndex(strategy_index)
+            self._update_ollama_controls()
             self._update_branch_controls()
             self._update_task_state()
 
@@ -379,6 +498,47 @@ def main() -> None:
             model_index = self._model_combo.findData(get_model_name(provider=provider))
             if model_index >= 0:
                 self._model_combo.setCurrentIndex(model_index)
+
+        def _update_ollama_controls(self) -> None:
+            is_ollama = self._selected_provider() == LLM_PROVIDER_OLLAMA
+            self._ollama_button.setVisible(is_ollama)
+            self._ollama_button.setDisabled(not is_ollama or self._ollama_worker is not None)
+
+        def _start_ollama(self) -> None:
+            if self._selected_provider() != LLM_PROVIDER_OLLAMA:
+                return
+
+            try:
+                base_url = get_ollama_base_url()
+            except RuntimeError as error:
+                self._append_message(ERROR_AUTHOR, str(error))
+                return
+
+            self._ollama_button.setDisabled(True)
+            self._status_label.setText("Ollama...")
+            self._ollama_worker = OllamaWorker(base_url, self._selected_model_name())
+            self._ollama_worker.progress.connect(self._handle_ollama_progress)
+            self._ollama_worker.completed.connect(self._handle_ollama_ready)
+            self._ollama_worker.failed.connect(self._handle_ollama_error)
+            self._ollama_worker.finished.connect(self._handle_ollama_finished)
+            self._ollama_worker.start()
+
+        def _handle_ollama_progress(self, message: str) -> None:
+            self._status_label.setText(message)
+
+        def _handle_ollama_ready(self, message: str, process: object) -> None:
+            if isinstance(process, subprocess.Popen):
+                self._ollama_process = process
+            self._status_label.setText("Готов")
+            self._append_message(AGENT_AUTHOR, message)
+
+        def _handle_ollama_error(self, error: str) -> None:
+            self._status_label.setText("Готов")
+            self._append_message(ERROR_AUTHOR, error)
+
+        def _handle_ollama_finished(self) -> None:
+            self._ollama_worker = None
+            self._update_ollama_controls()
 
         def _update_branch_controls(self) -> None:
             is_branching = self._selected_strategy() == ContextStrategy.BRANCHING
@@ -502,6 +662,11 @@ def main() -> None:
 
             self._load_history()
             self._update_task_state()
+
+        def closeEvent(self, event: Any) -> None:
+            if self._ollama_process is not None and self._ollama_process.poll() is None:
+                self._ollama_process.terminate()
+            super().closeEvent(event)
 
     app = QApplication(sys.argv)
     window = ChatWindow()

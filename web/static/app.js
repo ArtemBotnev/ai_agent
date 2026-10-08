@@ -50,7 +50,7 @@ function appendMessage(kind, author, text, metaText = '') {
   item.scrollIntoView({ block: 'end', behavior: 'smooth' });
 }
 
-function getTokenMeta(tokens) {
+function getResponseMeta(tokens, durationSeconds) {
   if (!tokens || typeof tokens !== 'object') {
     return '';
   }
@@ -62,7 +62,13 @@ function getTokenMeta(tokens) {
     return '';
   }
 
-  return `Токены: запрос ${currentRequest} · история ${history} · ответ ${response}`;
+  const meta = [`Токены: запрос ${currentRequest} · история ${history} · ответ ${response}`];
+  const duration = Number(durationSeconds);
+  if (Number.isFinite(duration)) {
+    meta.push(`время ${duration.toFixed(2)} с`);
+  }
+
+  return meta.join(' · ');
 }
 
 function setLoading(isLoading) {
@@ -146,7 +152,7 @@ form.addEventListener('submit', async (event) => {
       return;
     }
 
-    appendMessage('agent', 'Агент', data.answer, getTokenMeta(data.tokens));
+    appendMessage('agent', 'Агент', data.answer, getResponseMeta(data.tokens, data.duration_seconds));
   } catch (error) {
     appendMessage('error', 'Ошибка', 'Не удалось подключиться к web-серверу.');
   } finally {

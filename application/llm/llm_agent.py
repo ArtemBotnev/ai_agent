@@ -8,6 +8,7 @@ from domain.message import Message
 class LlmAnswer:
     text: str
     response_tokens: int
+    duration_seconds: float = 0.0
 
 
 class LlmAgent(Protocol):

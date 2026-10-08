@@ -1,0 +1,102 @@
+# Main agent configuration.
+# Environment variables still work as temporary overrides.
+
+# Available providers: openai, ollama.
+provider: ollama
+
+ollama:
+  # Ollama HTTP API base URL.
+  # Typical local value: http://127.0.0.1:11434
+  base_url: http://127.0.0.1:11434
+
+  # Active Ollama model.
+  # Can be any model available in `ollama list`.
+  # Examples: llama3.1:8b, qwen2.5:7b, codellama:7b, custom-agent-q4.
+  model: llama3.1:8b
+
+  # Models shown in CLI/UI for this provider.
+  # Include normal and quantized variants if available.
+  models:
+    - llama3.1:8b
+    - llama3.1:8b-instruct-q4_K_M
+    - qwen2.5:7b
+
+  options:
+    # Sampling randomness.
+    # Range: 0.0-2.0.
+    # Lower = more deterministic and stable.
+    # Higher = more creative, but less predictable.
+    # Recommended for coding/agent tasks: 0.1-0.4.
+    temperature: 0.2
+
+    # Maximum number of tokens to generate.
+    # Ollama parameter: num_predict.
+    # Range: 1-N, where N depends on model and available memory.
+    # -1 means unlimited in Ollama, but avoid it for app usage.
+    # Recommended for chat/coding: 1024-4096.
+    num_predict: 1024
+
+    # Context window size in tokens.
+    # Ollama parameter: num_ctx.
+    # Range: usually 2048-32768+, depending on model and RAM/VRAM.
+    # Higher values consume more memory and may slow responses.
+    # Recommended for local 7B/8B models: 4096-8192.
+    num_ctx: 4096
+
+    # Top-k sampling.
+    # Range: 1-100+.
+    # Lower = more conservative token choices.
+    # Higher = more diverse output.
+    # Ollama default is usually 40.
+    # Recommended for agent tasks: 20-50.
+    top_k: 40
+
+    # Top-p nucleus sampling.
+    # Range: 0.0-1.0.
+    # Lower = more focused output.
+    # Higher = more diverse output.
+    # Recommended for agent tasks: 0.7-0.95.
+    top_p: 0.7
+
+    # Repetition penalty.
+    # Range: usually 1.0-1.5.
+    # 1.0 disables extra penalty.
+    # Higher values reduce repeated phrases but can hurt coherence.
+    # Recommended: 1.05-1.2.
+    repeat_penalty: 1.1
+
+    # Deterministic seed.
+    # Range: integer >= 0.
+    # 0 lets Ollama choose/default behavior.
+    # Use a fixed value like 42 for repeatable tests.
+    seed: 0
+
+  # Markdown file with Ollama-specific system prompt.
+  # Relative paths are resolved from the directory containing this YAML file.
+  system_prompt_file: prompts/ollama_system.md
+
+openai:
+  # Active OpenAI model.
+  model: gpt-4o-mini
+
+  # Models shown in CLI/UI for this provider.
+  models:
+    - gpt-3.5-turbo-0125
+    - gpt-4o-mini
+    - gpt-4o
+    - gpt-5
+
+  # Optional Markdown file with OpenAI-specific system prompt.
+  # If omitted or missing, the built-in default system prompt is used.
+  system_prompt_file: prompts/openai_system.md
+
+paths:
+  # Runtime chat history and memory.
+  # Usually should stay outside config if committed to git.
+  memory_dir: memory/users
+
+  # Durable user profile files.
+  profiles_dir: agent_config/profiles/users
+
+  # Hard constraints/invariants for the assistant.
+  invariants_dir: agent_config/invariants/users

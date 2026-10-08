@@ -12,6 +12,7 @@ from agent import (
     OLLAMA_MODEL_ENV,
     OLLAMA_MODELS_ENV,
     OLLAMA_BASE_URL_ENV,
+    OllamaOptions,
     OPENAI_API_KEY_ENV,
     OPENAI_MODEL_ENV,
     PLANNING_ANALYST_SYSTEM_PROMPT,
@@ -54,6 +55,7 @@ from application.memory.working_memory_repository import WorkingMemoryRepository
 from application.summary.conversation_summarizer import ConversationSummarizer
 from application.summary.conversation_summary_repository import ConversationSummaryRepository
 from application.workflow.task_stage_agents import DoneAgent, ExecutionAgent, PlanningAgent, ValidationAgent
+from config.agent_config import load_agent_config
 from domain.working_memory import WorkingMemory
 from infrastructure.json_branch_repository import JsonBranchRepository
 from infrastructure.json_conversation_summary_repository import JsonConversationSummaryRepository
@@ -84,6 +86,13 @@ AGENT_RECENT_MESSAGES_LIMIT_ENV = "AGENT_RECENT_MESSAGES_LIMIT"
 AGENT_CONTEXT_STRATEGY_ENV = "AGENT_CONTEXT_STRATEGY"
 AGENT_PLANNING_MODE_ENV = "AGENT_PLANNING_MODE"
 AGENT_LLM_PROVIDER_ENV = "AGENT_LLM_PROVIDER"
+OLLAMA_TEMPERATURE_ENV = "AGENT_OLLAMA_TEMPERATURE"
+OLLAMA_MAX_TOKENS_ENV = "AGENT_OLLAMA_MAX_TOKENS"
+OLLAMA_CONTEXT_WINDOW_ENV = "AGENT_OLLAMA_CONTEXT_WINDOW"
+OLLAMA_TOP_K_ENV = "AGENT_OLLAMA_TOP_K"
+OLLAMA_TOP_P_ENV = "AGENT_OLLAMA_TOP_P"
+OLLAMA_REPEAT_PENALTY_ENV = "AGENT_OLLAMA_REPEAT_PENALTY"
+OLLAMA_SEED_ENV = "AGENT_OLLAMA_SEED"
 LLM_PROVIDER_OPENAI = "openai"
 LLM_PROVIDER_OLLAMA = "ollama"
 LLM_PROVIDERS = (LLM_PROVIDER_OPENAI, LLM_PROVIDER_OLLAMA)
@@ -116,13 +125,14 @@ def build_llm_agent(
         return OllamaLlmAgent(
             model=selected_model_name,
             base_url=get_ollama_base_url(),
-            system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
+            system_prompt=system_prompt or get_provider_system_prompt(selected_provider),
+            options=get_ollama_options(),
         )
 
     return SimpleLlmAgent(
         api_key=get_api_key(),
         model=selected_model_name,
-        system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
+        system_prompt=system_prompt or get_provider_system_prompt(selected_provider),
     )
 
 
@@ -244,7 +254,13 @@ def get_api_key() -> str:
 
 
 def get_llm_provider(provider: str | None = None) -> str:
-    selected_provider = (provider or os.getenv(AGENT_LLM_PROVIDER_ENV, LLM_PROVIDER_OPENAI)).strip().lower()
+    config_provider = load_agent_config().provider
+    selected_provider = (
+        provider
+        or os.getenv(AGENT_LLM_PROVIDER_ENV)
+        or config_provider
+        or LLM_PROVIDER_OPENAI
+    ).strip().lower()
     if selected_provider not in LLM_PROVIDERS:
         available_providers = ", ".join(LLM_PROVIDERS)
         raise RuntimeError(f"Переменная {AGENT_LLM_PROVIDER_ENV} должна быть одной из: {available_providers}.")
@@ -253,34 +269,77 @@ def get_llm_provider(provider: str | None = None) -> str:
 
 
 def get_ollama_base_url() -> str:
-    base_url = os.getenv(OLLAMA_BASE_URL_ENV, DEFAULT_OLLAMA_BASE_URL).strip()
+    config_base_url = load_agent_config().ollama.base_url
+    base_url = (os.getenv(OLLAMA_BASE_URL_ENV) or config_base_url or DEFAULT_OLLAMA_BASE_URL).strip()
     if not base_url:
         raise RuntimeError(f"Переменная {OLLAMA_BASE_URL_ENV} не должна быть пустой.")
 
     return base_url
 
 
+def get_ollama_options() -> OllamaOptions | None:
+    raw_options = dict(load_agent_config().ollama.options)
+    _set_env_float_option(raw_options, "temperature", OLLAMA_TEMPERATURE_ENV, minimum=0.0, maximum=2.0)
+    _set_env_int_option(raw_options, "num_predict", OLLAMA_MAX_TOKENS_ENV, minimum=-1)
+    _set_env_int_option(raw_options, "num_ctx", OLLAMA_CONTEXT_WINDOW_ENV, minimum=1)
+    _set_env_int_option(raw_options, "top_k", OLLAMA_TOP_K_ENV, minimum=1)
+    _set_env_float_option(raw_options, "top_p", OLLAMA_TOP_P_ENV, minimum=0.0, maximum=1.0)
+    _set_env_float_option(raw_options, "repeat_penalty", OLLAMA_REPEAT_PENALTY_ENV, minimum=0.0)
+    _set_env_int_option(raw_options, "seed", OLLAMA_SEED_ENV, minimum=0)
+    if not raw_options:
+        return None
+
+    return OllamaOptions(
+        temperature=_option_float(raw_options, "temperature"),
+        num_predict=_option_int(raw_options, "num_predict"),
+        num_ctx=_option_int(raw_options, "num_ctx"),
+        top_k=_option_int(raw_options, "top_k"),
+        top_p=_option_float(raw_options, "top_p"),
+        repeat_penalty=_option_float(raw_options, "repeat_penalty"),
+        seed=_option_int(raw_options, "seed"),
+    )
+
+
 def get_available_model_names(provider: str | None = None) -> list[str]:
     selected_provider = get_llm_provider(provider)
+    config = load_agent_config()
     if selected_provider == LLM_PROVIDER_OLLAMA:
         raw_models = os.getenv(OLLAMA_MODELS_ENV, "").strip()
-        model_names = [model.strip() for model in raw_models.split(",") if model.strip()]
-        selected_model = os.getenv(OLLAMA_MODEL_ENV, "").strip()
+        model_names = (
+            [model.strip() for model in raw_models.split(",") if model.strip()]
+            if raw_models
+            else list(config.ollama.models)
+        )
+        selected_model = (os.getenv(OLLAMA_MODEL_ENV) or config.ollama.model or "").strip()
         if selected_model and selected_model not in model_names:
             model_names.insert(0, selected_model)
 
         return model_names or [DEFAULT_OLLAMA_MODEL]
 
-    return list(AVAILABLE_OPENAI_MODELS)
+    model_names = list(config.openai.models or AVAILABLE_OPENAI_MODELS)
+    selected_model = (os.getenv(OPENAI_MODEL_ENV) or config.openai.model or "").strip()
+    if selected_model and selected_model not in model_names:
+        model_names.insert(0, selected_model)
+
+    return model_names
 
 
 def get_model_name(model_name: str | None = None, provider: str | None = None) -> str:
     selected_provider = get_llm_provider(provider)
+    config = load_agent_config()
     available_model_names = get_available_model_names(selected_provider)
     default_model = (
-        os.getenv(OLLAMA_MODEL_ENV, available_model_names[0])
+        (
+            os.getenv(OLLAMA_MODEL_ENV)
+            or config.ollama.model
+            or available_model_names[0]
+        )
         if selected_provider == LLM_PROVIDER_OLLAMA
-        else os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL)
+        else (
+            os.getenv(OPENAI_MODEL_ENV)
+            or config.openai.model
+            or DEFAULT_OPENAI_MODEL
+        )
     )
     selected_model = (model_name or default_model).strip()
     if not selected_model:
@@ -292,6 +351,101 @@ def get_model_name(model_name: str | None = None, provider: str | None = None) -
         raise RuntimeError(f"Модель должна быть одной из: {available_models}.")
 
     return selected_model
+
+
+def get_provider_system_prompt(provider: str | None = None) -> str:
+    selected_provider = get_llm_provider(provider)
+    config = load_agent_config()
+    prompt_file = (
+        config.ollama.system_prompt_file
+        if selected_provider == LLM_PROVIDER_OLLAMA
+        else config.openai.system_prompt_file
+    )
+    if prompt_file is None:
+        return DEFAULT_SYSTEM_PROMPT
+    if not prompt_file.exists():
+        raise RuntimeError(f"Файл system prompt не найден: {prompt_file}")
+
+    prompt = prompt_file.read_text(encoding="utf-8").strip()
+    return prompt or DEFAULT_SYSTEM_PROMPT
+
+
+def get_memory_dir() -> Path:
+    return load_agent_config().paths.memory_dir or DEFAULT_MEMORY_DIR
+
+
+def get_profiles_dir() -> Path:
+    return load_agent_config().paths.profiles_dir or DEFAULT_PROFILES_DIR
+
+
+def get_invariants_dir() -> Path:
+    return load_agent_config().paths.invariants_dir or DEFAULT_INVARIANTS_DIR
+
+
+def _set_env_int_option(
+    options: dict[str, int | float],
+    option_name: str,
+    env_name: str,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> None:
+    raw_value = os.getenv(env_name)
+    if raw_value is None or not raw_value.strip():
+        return
+
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise RuntimeError(f"Переменная {env_name} должна быть целым числом.") from error
+
+    if minimum is not None and value < minimum:
+        raise RuntimeError(f"Переменная {env_name} должна быть >= {minimum}.")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(f"Переменная {env_name} должна быть <= {maximum}.")
+
+    options[option_name] = value
+
+
+def _set_env_float_option(
+    options: dict[str, int | float],
+    option_name: str,
+    env_name: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> None:
+    raw_value = os.getenv(env_name)
+    if raw_value is None or not raw_value.strip():
+        return
+
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise RuntimeError(f"Переменная {env_name} должна быть числом.") from error
+
+    if minimum is not None and value < minimum:
+        raise RuntimeError(f"Переменная {env_name} должна быть >= {minimum}.")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(f"Переменная {env_name} должна быть <= {maximum}.")
+
+    options[option_name] = value
+
+
+def _option_int(options: dict[str, int | float], option_name: str) -> int | None:
+    value = options.get(option_name)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _option_float(options: dict[str, int | float], option_name: str) -> float | None:
+    value = options.get(option_name)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
 
 
 def build_history_repository(user_id: str | None = None) -> MessageHistoryRepository:
@@ -335,7 +489,7 @@ def get_user_id(user_id: str | None = None) -> str:
 
 def get_available_user_ids() -> list[str]:
     user_ids = {get_user_id()}
-    for users_dir in (DEFAULT_MEMORY_DIR, DEFAULT_PROFILES_DIR, DEFAULT_INVARIANTS_DIR):
+    for users_dir in (get_memory_dir(), get_profiles_dir(), get_invariants_dir()):
         if not users_dir.exists():
             continue
 
@@ -352,15 +506,15 @@ def get_available_user_ids() -> list[str]:
 
 
 def build_user_memory_file(file_name: str, user_id: str | None = None) -> Path:
-    return DEFAULT_MEMORY_DIR / get_user_id(user_id) / file_name
+    return get_memory_dir() / get_user_id(user_id) / file_name
 
 
 def build_user_profile_file(user_id: str | None = None) -> Path:
-    return DEFAULT_PROFILES_DIR / get_user_id(user_id) / "profile.md"
+    return get_profiles_dir() / get_user_id(user_id) / "profile.md"
 
 
 def build_user_invariants_file(user_id: str | None = None) -> Path:
-    return DEFAULT_INVARIANTS_DIR / get_user_id(user_id) / "invariants.md"
+    return get_invariants_dir() / get_user_id(user_id) / "invariants.md"
 
 
 def build_user_profile_repository(user_id: str | None = None) -> UserProfileRepository:
@@ -528,7 +682,8 @@ def run_chat(chat_service: ChatService) -> None:
             "Токены: "
             f"текущий запрос — {response.tokens.current_request}, "
             f"история — {response.tokens.history}, "
-            f"ответ — {response.tokens.response}"
+            f"ответ — {response.tokens.response}, "
+            f"время — {response.duration_seconds:.2f} с"
         )
 
 
