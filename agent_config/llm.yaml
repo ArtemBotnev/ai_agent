@@ -1,7 +1,7 @@
 # Main agent configuration.
 # Environment variables still work as temporary overrides.
 
-# Available providers: openai, ollama.
+# Available providers: openai, ollama, cloud.
 provider: ollama
 
 ollama:
@@ -89,6 +89,32 @@ openai:
   # Optional Markdown file with OpenAI-specific system prompt.
   # If omitted or missing, the built-in default system prompt is used.
   system_prompt_file: prompts/openai_system.md
+
+cloud:
+  # Ollama-compatible cloud endpoint.
+  # Private connection settings are loaded from agent_config/llm.local.yaml,
+  # which must not be committed to git.
+  config_file: llm.local.yaml
+
+  # Active cloud model.
+  model: my-llama
+
+  # Models shown in CLI/UI for this provider.
+  # If the cloud API later exposes model discovery, this can stay as fallback.
+  models:
+    - my-llama
+
+  options:
+    temperature: 0.2
+    num_predict: 1024
+    num_ctx: 4096
+    top_k: 40
+    top_p: 0.7
+    repeat_penalty: 1.1
+    seed: 0
+
+  # Reuse the Ollama-style system prompt for the Ollama-compatible cloud API.
+  system_prompt_file: prompts/ollama_system.md
 
 paths:
   # Runtime chat history and memory.

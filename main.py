@@ -93,9 +93,14 @@ OLLAMA_TOP_K_ENV = "AGENT_OLLAMA_TOP_K"
 OLLAMA_TOP_P_ENV = "AGENT_OLLAMA_TOP_P"
 OLLAMA_REPEAT_PENALTY_ENV = "AGENT_OLLAMA_REPEAT_PENALTY"
 OLLAMA_SEED_ENV = "AGENT_OLLAMA_SEED"
+CLOUD_BASE_URL_ENV = "AGENT_CLOUD_URL"
+CLOUD_MODEL_ENV = "AGENT_CLOUD_MODEL"
+CLOUD_MODELS_ENV = "AGENT_CLOUD_MODELS"
+DEFAULT_CLOUD_MODEL = "my-llama"
 LLM_PROVIDER_OPENAI = "openai"
 LLM_PROVIDER_OLLAMA = "ollama"
-LLM_PROVIDERS = (LLM_PROVIDER_OPENAI, LLM_PROVIDER_OLLAMA)
+LLM_PROVIDER_CLOUD = "cloud"
+LLM_PROVIDERS = (LLM_PROVIDER_OPENAI, LLM_PROVIDER_OLLAMA, LLM_PROVIDER_CLOUD)
 PLANNING_MODE_SINGLE = "single"
 PLANNING_MODE_DEBATE = "debate"
 PLANNING_MODES = (PLANNING_MODE_SINGLE, PLANNING_MODE_DEBATE)
@@ -121,12 +126,12 @@ def build_llm_agent(
 ) -> SimpleLlmAgent | OllamaLlmAgent:
     selected_provider = get_llm_provider(provider)
     selected_model_name = get_model_name(model_name, selected_provider)
-    if selected_provider == LLM_PROVIDER_OLLAMA:
+    if uses_ollama_chat_api(selected_provider):
         return OllamaLlmAgent(
             model=selected_model_name,
-            base_url=get_ollama_base_url(),
+            base_url=get_ollama_compatible_base_url(selected_provider),
             system_prompt=system_prompt or get_provider_system_prompt(selected_provider),
-            options=get_ollama_options(),
+            options=get_ollama_compatible_options(selected_provider),
         )
 
     return SimpleLlmAgent(
@@ -277,6 +282,24 @@ def get_ollama_base_url() -> str:
     return base_url
 
 
+def get_cloud_base_url() -> str:
+    config_base_url = load_agent_config().cloud.base_url
+    base_url = (os.getenv(CLOUD_BASE_URL_ENV) or config_base_url or "").strip()
+    if not base_url:
+        raise RuntimeError(
+            f"Укажите cloud.base_url в приватном конфиге или переменную {CLOUD_BASE_URL_ENV}."
+        )
+
+    return base_url
+
+
+def get_ollama_compatible_base_url(provider: str) -> str:
+    if provider == LLM_PROVIDER_CLOUD:
+        return get_cloud_base_url()
+
+    return get_ollama_base_url()
+
+
 def get_ollama_options() -> OllamaOptions | None:
     raw_options = dict(load_agent_config().ollama.options)
     _set_env_float_option(raw_options, "temperature", OLLAMA_TEMPERATURE_ENV, minimum=0.0, maximum=2.0)
@@ -300,6 +323,29 @@ def get_ollama_options() -> OllamaOptions | None:
     )
 
 
+def get_cloud_options() -> OllamaOptions | None:
+    raw_options = dict(load_agent_config().cloud.options)
+    if not raw_options:
+        return None
+
+    return OllamaOptions(
+        temperature=_option_float(raw_options, "temperature"),
+        num_predict=_option_int(raw_options, "num_predict"),
+        num_ctx=_option_int(raw_options, "num_ctx"),
+        top_k=_option_int(raw_options, "top_k"),
+        top_p=_option_float(raw_options, "top_p"),
+        repeat_penalty=_option_float(raw_options, "repeat_penalty"),
+        seed=_option_int(raw_options, "seed"),
+    )
+
+
+def get_ollama_compatible_options(provider: str) -> OllamaOptions | None:
+    if provider == LLM_PROVIDER_CLOUD:
+        return get_cloud_options()
+
+    return get_ollama_options()
+
+
 def get_available_model_names(provider: str | None = None) -> list[str]:
     selected_provider = get_llm_provider(provider)
     config = load_agent_config()
@@ -316,6 +362,19 @@ def get_available_model_names(provider: str | None = None) -> list[str]:
 
         return model_names or [DEFAULT_OLLAMA_MODEL]
 
+    if selected_provider == LLM_PROVIDER_CLOUD:
+        raw_models = os.getenv(CLOUD_MODELS_ENV, "").strip()
+        model_names = (
+            [model.strip() for model in raw_models.split(",") if model.strip()]
+            if raw_models
+            else list(config.cloud.models)
+        )
+        selected_model = (os.getenv(CLOUD_MODEL_ENV) or config.cloud.model or "").strip()
+        if selected_model and selected_model not in model_names:
+            model_names.insert(0, selected_model)
+
+        return model_names or [DEFAULT_CLOUD_MODEL]
+
     model_names = list(config.openai.models or AVAILABLE_OPENAI_MODELS)
     selected_model = (os.getenv(OPENAI_MODEL_ENV) or config.openai.model or "").strip()
     if selected_model and selected_model not in model_names:
@@ -328,22 +387,18 @@ def get_model_name(model_name: str | None = None, provider: str | None = None) -
     selected_provider = get_llm_provider(provider)
     config = load_agent_config()
     available_model_names = get_available_model_names(selected_provider)
-    default_model = (
-        (
-            os.getenv(OLLAMA_MODEL_ENV)
-            or config.ollama.model
-            or available_model_names[0]
-        )
-        if selected_provider == LLM_PROVIDER_OLLAMA
-        else (
-            os.getenv(OPENAI_MODEL_ENV)
-            or config.openai.model
-            or DEFAULT_OPENAI_MODEL
-        )
-    )
+    if selected_provider == LLM_PROVIDER_OLLAMA:
+        default_model = os.getenv(OLLAMA_MODEL_ENV) or config.ollama.model or available_model_names[0]
+        model_env = OLLAMA_MODEL_ENV
+    elif selected_provider == LLM_PROVIDER_CLOUD:
+        default_model = os.getenv(CLOUD_MODEL_ENV) or config.cloud.model or available_model_names[0]
+        model_env = CLOUD_MODEL_ENV
+    else:
+        default_model = os.getenv(OPENAI_MODEL_ENV) or config.openai.model or DEFAULT_OPENAI_MODEL
+        model_env = OPENAI_MODEL_ENV
+
     selected_model = (model_name or default_model).strip()
     if not selected_model:
-        model_env = OLLAMA_MODEL_ENV if selected_provider == LLM_PROVIDER_OLLAMA else OPENAI_MODEL_ENV
         raise RuntimeError(f"Переменная {model_env} не должна быть пустой.")
 
     if selected_model not in available_model_names:
@@ -356,11 +411,12 @@ def get_model_name(model_name: str | None = None, provider: str | None = None) -
 def get_provider_system_prompt(provider: str | None = None) -> str:
     selected_provider = get_llm_provider(provider)
     config = load_agent_config()
-    prompt_file = (
-        config.ollama.system_prompt_file
-        if selected_provider == LLM_PROVIDER_OLLAMA
-        else config.openai.system_prompt_file
-    )
+    if selected_provider == LLM_PROVIDER_OLLAMA:
+        prompt_file = config.ollama.system_prompt_file
+    elif selected_provider == LLM_PROVIDER_CLOUD:
+        prompt_file = config.cloud.system_prompt_file
+    else:
+        prompt_file = config.openai.system_prompt_file
     if prompt_file is None:
         return DEFAULT_SYSTEM_PROMPT
     if not prompt_file.exists():
@@ -574,7 +630,7 @@ def get_recent_messages_limit() -> int:
 def get_context_strategy(provider: str | None = None) -> ContextStrategy:
     if AGENT_CONTEXT_STRATEGY_ENV in os.environ:
         raw_strategy = os.getenv(AGENT_CONTEXT_STRATEGY_ENV, ContextStrategy.MEMORY.value)
-    elif get_llm_provider(provider) == LLM_PROVIDER_OLLAMA:
+    elif uses_ollama_chat_api(get_llm_provider(provider)):
         raw_strategy = ContextStrategy.SUMMARY.value
     else:
         raw_strategy = ContextStrategy.MEMORY.value
@@ -608,7 +664,7 @@ def build_chat_service(
     selected_model_name = get_model_name(model_name, selected_provider)
     selected_user_id = get_user_id(user_id)
     selected_context_strategy = context_strategy or get_context_strategy(selected_provider)
-    return ChatService(
+    chat_service = ChatService(
         agent=build_agent(selected_model_name, selected_provider),
         history_repository=build_history_repository(selected_user_id),
         summary_repository=build_summary_repository(),
@@ -629,7 +685,9 @@ def build_chat_service(
         execution_agent=build_execution_agent(selected_model_name, selected_provider),
         validation_agent=build_validation_agent(selected_model_name, selected_provider),
         done_agent=build_done_agent(selected_model_name, selected_provider),
+        provider=selected_provider,
     )
+    return chat_service
 
 
 def format_agent_error(error: AgentError) -> str:
@@ -778,6 +836,8 @@ def handle_provider_command(chat_service: ChatService, argument: str) -> ChatSer
     context_strategy = chat_service.get_context_strategy()
     if provider == LLM_PROVIDER_OLLAMA and AGENT_CONTEXT_STRATEGY_ENV not in os.environ:
         context_strategy = ContextStrategy.SUMMARY
+    if provider == LLM_PROVIDER_CLOUD and AGENT_CONTEXT_STRATEGY_ENV not in os.environ:
+        context_strategy = ContextStrategy.SUMMARY
 
     updated_chat_service = build_chat_service(
         context_strategy=context_strategy,
@@ -791,11 +851,19 @@ def handle_provider_command(chat_service: ChatService, argument: str) -> ChatSer
 
 
 def get_chat_service_provider(chat_service: ChatService) -> str:
+    provider = getattr(chat_service, "_provider", None)
+    if isinstance(provider, str) and provider in LLM_PROVIDERS:
+        return provider
+
     agent = getattr(chat_service, "_agent", None)
     if isinstance(agent, OllamaLlmAgent):
         return LLM_PROVIDER_OLLAMA
 
     return LLM_PROVIDER_OPENAI
+
+
+def uses_ollama_chat_api(provider: str) -> bool:
+    return provider in {LLM_PROVIDER_OLLAMA, LLM_PROVIDER_CLOUD}
 
 
 def handle_strategy_command(chat_service: ChatService, argument: str) -> None:

@@ -77,8 +77,10 @@ class ChatService:
         execution_agent: ExecutionAgent | None = None,
         validation_agent: ValidationAgent | None = None,
         done_agent: DoneAgent | None = None,
+        provider: str | None = None,
     ) -> None:
         self._agent = agent
+        self._provider = provider
         self._history_repository = history_repository
         self._summary_repository = summary_repository
         self._summarizer = summarizer

@@ -1,12 +1,13 @@
 import html
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
 from typing import Any
-from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from application.chat.agent_error import AgentError
 from application.chat.chat_service import ChatResponse
@@ -23,6 +24,7 @@ from main import (
     AGENT_CONTEXT_STRATEGY_ENV,
     build_branch_repository,
     build_facts_repository,
+    get_cloud_base_url,
     get_ollama_base_url,
     get_llm_provider,
     get_available_model_names,
@@ -30,6 +32,7 @@ from main import (
     get_model_name,
     get_user_id,
     LLM_PROVIDER_OLLAMA,
+    LLM_PROVIDER_CLOUD,
     LLM_PROVIDERS,
     build_long_term_memory_repository,
     build_summary_repository,
@@ -221,11 +224,78 @@ def main() -> None:
                 details = (result.stderr or result.stdout).strip()
                 raise RuntimeError(f"Не удалось загрузить модель {self._model_name}. {details}".strip())
 
+    class CloudCheckWorker(QThread):
+        completed = pyqtSignal(str)
+        failed = pyqtSignal(str)
+
+        def __init__(self, base_url: str, model_name: str) -> None:
+            super().__init__()
+            self._base_url = base_url.rstrip("/")
+            self._model_name = model_name
+
+        def run(self) -> None:
+            payload = {
+                "model": self._model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Reply with OK.",
+                    }
+                ],
+                "stream": False,
+                "options": {
+                    "num_predict": 8,
+                },
+            }
+            request = Request(
+                f"{self._base_url}/api/chat",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+
+            try:
+                with urlopen(request, timeout=30) as response:
+                    raw_body = response.read().decode("utf-8")
+            except HTTPError as error:
+                details = error.read().decode("utf-8", errors="replace").strip()
+                self.failed.emit(f"Облачная LLM вернула HTTP {error.code}. {details}".strip())
+                return
+            except (OSError, URLError, TimeoutError) as error:
+                self.failed.emit(f"Не удалось подключиться к облачной LLM: {error}")
+                return
+
+            try:
+                response_data = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self.failed.emit("Облачная LLM вернула некорректный JSON.")
+                return
+
+            if self._has_text_response(response_data):
+                self.completed.emit(f"Облако доступно. Модель: {self._model_name}")
+                return
+
+            self.failed.emit("Облачная LLM ответила, но текст ответа не найден.")
+
+        def _has_text_response(self, response_data: object) -> bool:
+            if not isinstance(response_data, dict):
+                return False
+
+            message = response_data.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    return True
+
+            response = response_data.get("response")
+            return isinstance(response, str) and bool(response.strip())
+
     class ChatWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
             self._worker: ChatWorker | None = None
             self._ollama_worker: OllamaWorker | None = None
+            self._cloud_worker: CloudCheckWorker | None = None
             self._ollama_process: subprocess.Popen[Any] | None = None
             self._is_loading_branches = False
 
@@ -241,6 +311,7 @@ def main() -> None:
             self._strategy_combo = QComboBox()
             self._branch_combo = QComboBox()
             self._ollama_button = QPushButton("Запустить Ollama")
+            self._cloud_button = QPushButton("Проверить облако")
             self._checkpoint_button = QPushButton("Checkpoint")
             self._new_branch_button = QPushButton("Новая ветка")
             self._clear_button = QPushButton("Очистить")
@@ -261,6 +332,7 @@ def main() -> None:
             self._send_button.setFixedWidth(140)
             self._clear_button.setFixedHeight(36)
             self._ollama_button.setFixedHeight(36)
+            self._cloud_button.setFixedHeight(36)
             self._checkpoint_button.setFixedHeight(36)
             self._new_branch_button.setFixedHeight(36)
 
@@ -296,6 +368,7 @@ def main() -> None:
             self._strategy_combo.currentIndexChanged.connect(self._handle_strategy_changed)
             self._branch_combo.currentIndexChanged.connect(self._handle_branch_changed)
             self._ollama_button.clicked.connect(self._start_ollama)
+            self._cloud_button.clicked.connect(self._check_cloud)
             self._checkpoint_button.clicked.connect(self._save_checkpoint)
             self._new_branch_button.clicked.connect(self._create_branch)
 
@@ -310,6 +383,7 @@ def main() -> None:
             header_layout.addWidget(QLabel("Модель:"))
             header_layout.addWidget(self._model_combo)
             header_layout.addWidget(self._ollama_button)
+            header_layout.addWidget(self._cloud_button)
             header_layout.addSpacing(16)
             header_layout.addWidget(QLabel("Стратегия:"))
             header_layout.addWidget(self._strategy_combo)
@@ -335,6 +409,7 @@ def main() -> None:
             self.setCentralWidget(root)
             self.setStyleSheet(WINDOW_STYLESHEET)
             self._update_ollama_controls()
+            self._update_cloud_controls()
             self._update_branch_controls()
             self._update_task_state()
 
@@ -411,6 +486,7 @@ def main() -> None:
             self._provider_combo.setDisabled(is_loading)
             self._model_combo.setDisabled(is_loading)
             self._ollama_button.setDisabled(is_loading or self._selected_provider() != LLM_PROVIDER_OLLAMA)
+            self._cloud_button.setDisabled(is_loading or self._selected_provider() != LLM_PROVIDER_CLOUD)
             self._strategy_combo.setDisabled(is_loading)
             self._branch_combo.setDisabled(is_loading)
             self._checkpoint_button.setDisabled(is_loading)
@@ -419,6 +495,7 @@ def main() -> None:
             self._status_label.setText("Запрос..." if is_loading else "Готов")
             if not is_loading:
                 self._update_ollama_controls()
+                self._update_cloud_controls()
                 self._update_branch_controls()
                 self._update_task_state()
 
@@ -482,11 +559,15 @@ def main() -> None:
 
         def _handle_provider_changed(self, *_args: Any) -> None:
             self._refresh_model_combo()
-            if self._selected_provider() == LLM_PROVIDER_OLLAMA and AGENT_CONTEXT_STRATEGY_ENV not in os.environ:
+            if (
+                self._selected_provider() in {LLM_PROVIDER_OLLAMA, LLM_PROVIDER_CLOUD}
+                and AGENT_CONTEXT_STRATEGY_ENV not in os.environ
+            ):
                 strategy_index = self._strategy_combo.findData(ContextStrategy.SUMMARY.value)
                 if strategy_index >= 0:
                     self._strategy_combo.setCurrentIndex(strategy_index)
             self._update_ollama_controls()
+            self._update_cloud_controls()
             self._update_branch_controls()
             self._update_task_state()
 
@@ -503,6 +584,11 @@ def main() -> None:
             is_ollama = self._selected_provider() == LLM_PROVIDER_OLLAMA
             self._ollama_button.setVisible(is_ollama)
             self._ollama_button.setDisabled(not is_ollama or self._ollama_worker is not None)
+
+        def _update_cloud_controls(self) -> None:
+            is_cloud = self._selected_provider() == LLM_PROVIDER_CLOUD
+            self._cloud_button.setVisible(is_cloud)
+            self._cloud_button.setDisabled(not is_cloud or self._cloud_worker is not None)
 
         def _start_ollama(self) -> None:
             if self._selected_provider() != LLM_PROVIDER_OLLAMA:
@@ -523,6 +609,24 @@ def main() -> None:
             self._ollama_worker.finished.connect(self._handle_ollama_finished)
             self._ollama_worker.start()
 
+        def _check_cloud(self) -> None:
+            if self._selected_provider() != LLM_PROVIDER_CLOUD:
+                return
+
+            try:
+                base_url = get_cloud_base_url()
+            except RuntimeError as error:
+                self._append_message(ERROR_AUTHOR, str(error))
+                return
+
+            self._cloud_button.setDisabled(True)
+            self._status_label.setText("Проверка облака...")
+            self._cloud_worker = CloudCheckWorker(base_url, self._selected_model_name())
+            self._cloud_worker.completed.connect(self._handle_cloud_ready)
+            self._cloud_worker.failed.connect(self._handle_cloud_error)
+            self._cloud_worker.finished.connect(self._handle_cloud_finished)
+            self._cloud_worker.start()
+
         def _handle_ollama_progress(self, message: str) -> None:
             self._status_label.setText(message)
 
@@ -539,6 +643,18 @@ def main() -> None:
         def _handle_ollama_finished(self) -> None:
             self._ollama_worker = None
             self._update_ollama_controls()
+
+        def _handle_cloud_ready(self, message: str) -> None:
+            self._status_label.setText("Готов")
+            self._append_message(AGENT_AUTHOR, message)
+
+        def _handle_cloud_error(self, error: str) -> None:
+            self._status_label.setText("Готов")
+            self._append_message(ERROR_AUTHOR, error)
+
+        def _handle_cloud_finished(self) -> None:
+            self._cloud_worker = None
+            self._update_cloud_controls()
 
         def _update_branch_controls(self) -> None:
             is_branching = self._selected_strategy() == ContextStrategy.BRANCHING

@@ -1,0 +1,14 @@
+# Copy this file to agent_config/llm.local.yaml and set the real cloud URL there.
+# agent_config/llm.local.yaml is ignored by git.
+
+cloud:
+  # Ollama-compatible cloud HTTP API base URL.
+  # The client will call {base_url}/api/chat.
+  base_url: https://your-cloud-llm.example.com
+
+  # Cloud model name.
+  model: my-llama
+
+  # Models shown in CLI/UI for the cloud provider.
+  models:
+    - my-llama

@@ -30,6 +30,11 @@ class OllamaConfig(ProviderConfig):
 
 
 @dataclass(frozen=True)
+class CloudConfig(OllamaConfig):
+    config_file: Path | None = None
+
+
+@dataclass(frozen=True)
 class PathConfig:
     memory_dir: Path | None = None
     profiles_dir: Path | None = None
@@ -42,6 +47,7 @@ class AgentConfig:
     provider: str | None = None
     openai: ProviderConfig = field(default_factory=ProviderConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    cloud: CloudConfig = field(default_factory=CloudConfig)
     paths: PathConfig = field(default_factory=PathConfig)
 
     @property
@@ -56,6 +62,20 @@ def load_agent_config() -> AgentConfig:
             raise RuntimeError(f"Файл конфигурации {config_file} не найден.")
         return AgentConfig(config_file=config_file)
 
+    raw_config = _load_config_mapping(config_file)
+    raw_config = _merge_private_cloud_config(raw_config, config_file)
+
+    return AgentConfig(
+        config_file=config_file,
+        provider=_optional_str(raw_config, "provider"),
+        openai=_read_provider_config(raw_config.get("openai"), config_file),
+        ollama=_read_ollama_config(raw_config.get("ollama"), config_file),
+        cloud=_read_cloud_config(raw_config.get("cloud"), config_file),
+        paths=_read_path_config(raw_config.get("paths")),
+    )
+
+
+def _load_config_mapping(config_file: Path) -> dict[str, Any]:
     config_text = config_file.read_text(encoding="utf-8")
     raw_config = yaml.safe_load(config_text) if yaml is not None else _parse_simple_yaml(config_text)
 
@@ -64,13 +84,31 @@ def load_agent_config() -> AgentConfig:
     if not isinstance(raw_config, dict):
         raise RuntimeError(f"Файл конфигурации {config_file} должен содержать YAML-объект.")
 
-    return AgentConfig(
-        config_file=config_file,
-        provider=_optional_str(raw_config, "provider"),
-        openai=_read_provider_config(raw_config.get("openai"), config_file),
-        ollama=_read_ollama_config(raw_config.get("ollama"), config_file),
-        paths=_read_path_config(raw_config.get("paths")),
-    )
+    return raw_config
+
+
+def _merge_private_cloud_config(raw_config: dict[str, Any], config_file: Path) -> dict[str, Any]:
+    cloud = _optional_mapping(raw_config.get("cloud"), "cloud")
+    if cloud is None:
+        return raw_config
+
+    private_config_file = _optional_path(cloud, "config_file")
+    if private_config_file is None:
+        return raw_config
+    if not private_config_file.is_absolute():
+        private_config_file = config_file.parent / private_config_file
+    if not private_config_file.exists():
+        return raw_config
+
+    private_config = _load_config_mapping(private_config_file)
+    private_cloud = _optional_mapping(private_config.get("cloud"), "cloud")
+    if private_cloud is None:
+        return raw_config
+
+    merged_config = dict(raw_config)
+    merged_cloud = {**cloud, **private_cloud, "config_file": str(private_config_file)}
+    merged_config["cloud"] = merged_cloud
+    return merged_config
 
 
 def _parse_simple_yaml(config_text: str) -> dict[str, Any]:
@@ -185,7 +223,22 @@ def _read_ollama_config(raw_provider: object, config_file: Path) -> OllamaConfig
         models=_string_tuple(provider.get("models"), "models"),
         system_prompt_file=_optional_prompt_path(provider, "system_prompt_file", config_file),
         base_url=_optional_str(provider, "base_url"),
-        options=_read_ollama_options(provider.get("options")),
+        options=_read_ollama_options(provider.get("options"), "ollama.options"),
+    )
+
+
+def _read_cloud_config(raw_provider: object, config_file: Path) -> CloudConfig:
+    provider = _optional_mapping(raw_provider, "cloud")
+    if provider is None:
+        return CloudConfig()
+
+    return CloudConfig(
+        model=_optional_str(provider, "model"),
+        models=_string_tuple(provider.get("models"), "models"),
+        system_prompt_file=_optional_prompt_path(provider, "system_prompt_file", config_file),
+        base_url=_optional_str(provider, "base_url"),
+        options=_read_ollama_options(provider.get("options"), "cloud.options"),
+        config_file=_optional_path(provider, "config_file"),
     )
 
 
@@ -201,19 +254,19 @@ def _read_path_config(raw_paths: object) -> PathConfig:
     )
 
 
-def _read_ollama_options(raw_options: object) -> dict[str, int | float]:
-    options = _optional_mapping(raw_options, "ollama.options")
+def _read_ollama_options(raw_options: object, name: str) -> dict[str, int | float]:
+    options = _optional_mapping(raw_options, name)
     if options is None:
         return {}
 
     supported_options = {
-        "temperature": _float_option(options, "temperature", minimum=0.0, maximum=2.0),
-        "num_predict": _int_option(options, "num_predict", minimum=-1),
-        "num_ctx": _int_option(options, "num_ctx", minimum=1),
-        "top_k": _int_option(options, "top_k", minimum=1),
-        "top_p": _float_option(options, "top_p", minimum=0.0, maximum=1.0),
-        "repeat_penalty": _float_option(options, "repeat_penalty", minimum=0.0),
-        "seed": _int_option(options, "seed", minimum=0),
+        "temperature": _float_option(options, "temperature", name=name, minimum=0.0, maximum=2.0),
+        "num_predict": _int_option(options, "num_predict", name=name, minimum=-1),
+        "num_ctx": _int_option(options, "num_ctx", name=name, minimum=1),
+        "top_k": _int_option(options, "top_k", name=name, minimum=1),
+        "top_p": _float_option(options, "top_p", name=name, minimum=0.0, maximum=1.0),
+        "repeat_penalty": _float_option(options, "repeat_penalty", name=name, minimum=0.0),
+        "seed": _int_option(options, "seed", name=name, minimum=0),
     }
     return {
         key: value
@@ -282,6 +335,7 @@ def _int_option(
     mapping: dict[str, Any],
     key: str,
     *,
+    name: str,
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int | None:
@@ -289,11 +343,11 @@ def _int_option(
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
-        raise RuntimeError(f"Параметр ollama.options.{key} должен быть целым числом.")
+        raise RuntimeError(f"Параметр {name}.{key} должен быть целым числом.")
     if minimum is not None and value < minimum:
-        raise RuntimeError(f"Параметр ollama.options.{key} должен быть >= {minimum}.")
+        raise RuntimeError(f"Параметр {name}.{key} должен быть >= {minimum}.")
     if maximum is not None and value > maximum:
-        raise RuntimeError(f"Параметр ollama.options.{key} должен быть <= {maximum}.")
+        raise RuntimeError(f"Параметр {name}.{key} должен быть <= {maximum}.")
 
     return value
 
@@ -302,6 +356,7 @@ def _float_option(
     mapping: dict[str, Any],
     key: str,
     *,
+    name: str,
     minimum: float | None = None,
     maximum: float | None = None,
 ) -> float | None:
@@ -309,12 +364,12 @@ def _float_option(
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise RuntimeError(f"Параметр ollama.options.{key} должен быть числом.")
+        raise RuntimeError(f"Параметр {name}.{key} должен быть числом.")
 
     float_value = float(value)
     if minimum is not None and float_value < minimum:
-        raise RuntimeError(f"Параметр ollama.options.{key} должен быть >= {minimum}.")
+        raise RuntimeError(f"Параметр {name}.{key} должен быть >= {minimum}.")
     if maximum is not None and float_value > maximum:
-        raise RuntimeError(f"Параметр ollama.options.{key} должен быть <= {maximum}.")
+        raise RuntimeError(f"Параметр {name}.{key} должен быть <= {maximum}.")
 
     return float_value
