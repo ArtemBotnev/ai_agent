@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .venv/
 /history
+/rag
 /memory
 /profiles/users/
 /invariants/users/

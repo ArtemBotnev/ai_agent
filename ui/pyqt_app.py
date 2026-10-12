@@ -10,8 +10,9 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from application.chat.agent_error import AgentError
-from application.chat.chat_service import ChatResponse
+from application.chat.chat_service import ChatResponse, ChatTokenUsage
 from application.chat.context_strategy import ContextStrategy
+from application.project_help.project_assistant_commands import parse_project_assistant_command
 from domain.conversation_branch import ConversationBranch, ConversationBranches
 from domain.conversation_summary import ConversationSummary
 from domain.long_term_memory import LongTermMemory
@@ -24,6 +25,7 @@ from main import (
     AGENT_CONTEXT_STRATEGY_ENV,
     build_branch_repository,
     build_facts_repository,
+    build_project_assistant_command_service,
     get_cloud_base_url,
     get_ollama_base_url,
     get_llm_provider,
@@ -108,19 +110,55 @@ def main() -> None:
 
         def run(self) -> None:
             try:
-                response = build_chat_service(
-                    self._context_strategy,
-                    self._model_name,
-                    self._user_id,
-                    self.task_stage_changed.emit,
-                    self._provider,
-                ).answer(self._message)
+                command = parse_project_assistant_command(self._message)
+                if command is None:
+                    response = self._build_chat_service().answer(self._message)
+                elif command.name == "/help":
+                    chat_service = self._build_chat_service()
+                    response = self._answer_project_assistant_command(command.name, command.argument, chat_service)
+                else:
+                    response = self._answer_project_assistant_command(command.name, command.argument, None)
             except RuntimeError as error:
                 self.failed.emit(str(error))
             except AgentError as error:
                 self.failed.emit(format_agent_error(error))
             else:
                 self.answered.emit(response)
+
+        def _build_chat_service(self) -> Any:
+            return build_chat_service(
+                self._context_strategy,
+                self._model_name,
+                self._user_id,
+                self.task_stage_changed.emit,
+                self._provider,
+            )
+
+        def _answer_project_assistant_command(
+            self,
+            name: str,
+            argument: str,
+            chat_service: Any | None,
+        ) -> ChatResponse:
+            command_service = build_project_assistant_command_service()
+            if name == "/project":
+                return self._text_response(command_service.project_status_text())
+            if name == "/project-rag":
+                return self._text_response(command_service.project_rag_text(argument))
+            if name == "/help":
+                if chat_service is None:
+                    raise RuntimeError("LLM service is required for /help.")
+                request = command_service.prepare_help_request(argument)
+                return chat_service.answer_once(request.prompt, context=request.context)
+
+            return self._text_response("Неизвестная команда project assistant.")
+
+        def _text_response(self, text: str) -> ChatResponse:
+            return ChatResponse(
+                text=text,
+                tokens=ChatTokenUsage(current_request=0, history=0, response=0),
+                duration_seconds=0.0,
+            )
 
     class OllamaWorker(QThread):
         progress = pyqtSignal(str)
@@ -312,6 +350,7 @@ def main() -> None:
             self._branch_combo = QComboBox()
             self._ollama_button = QPushButton("Запустить Ollama")
             self._cloud_button = QPushButton("Проверить облако")
+            self._project_rag_button = QPushButton("Собрать RAG")
             self._checkpoint_button = QPushButton("Checkpoint")
             self._new_branch_button = QPushButton("Новая ветка")
             self._clear_button = QPushButton("Очистить")
@@ -333,6 +372,7 @@ def main() -> None:
             self._clear_button.setFixedHeight(36)
             self._ollama_button.setFixedHeight(36)
             self._cloud_button.setFixedHeight(36)
+            self._project_rag_button.setFixedHeight(36)
             self._checkpoint_button.setFixedHeight(36)
             self._new_branch_button.setFixedHeight(36)
 
@@ -369,6 +409,7 @@ def main() -> None:
             self._branch_combo.currentIndexChanged.connect(self._handle_branch_changed)
             self._ollama_button.clicked.connect(self._start_ollama)
             self._cloud_button.clicked.connect(self._check_cloud)
+            self._project_rag_button.clicked.connect(self._build_project_rag)
             self._checkpoint_button.clicked.connect(self._save_checkpoint)
             self._new_branch_button.clicked.connect(self._create_branch)
 
@@ -384,6 +425,7 @@ def main() -> None:
             header_layout.addWidget(self._model_combo)
             header_layout.addWidget(self._ollama_button)
             header_layout.addWidget(self._cloud_button)
+            header_layout.addWidget(self._project_rag_button)
             header_layout.addSpacing(16)
             header_layout.addWidget(QLabel("Стратегия:"))
             header_layout.addWidget(self._strategy_combo)
@@ -410,6 +452,7 @@ def main() -> None:
             self.setStyleSheet(WINDOW_STYLESHEET)
             self._update_ollama_controls()
             self._update_cloud_controls()
+            self._update_project_rag_controls()
             self._update_branch_controls()
             self._update_task_state()
 
@@ -452,7 +495,7 @@ def main() -> None:
             self._worker.answered.connect(self._handle_answer)
             self._worker.failed.connect(self._handle_error)
             self._worker.task_stage_changed.connect(self._handle_task_stage_changed)
-            self._worker.finished.connect(lambda: self._set_loading(False))
+            self._worker.finished.connect(self._handle_worker_finished)
             self._worker.start()
 
         def _handle_answer(self, response: Any) -> None:
@@ -479,6 +522,10 @@ def main() -> None:
 
             self._set_task_state_text(memory)
 
+        def _handle_worker_finished(self) -> None:
+            self._worker = None
+            self._set_loading(False)
+
         def _set_loading(self, is_loading: bool) -> None:
             self._send_button.setDisabled(is_loading)
             self._input.setDisabled(is_loading)
@@ -487,6 +534,7 @@ def main() -> None:
             self._model_combo.setDisabled(is_loading)
             self._ollama_button.setDisabled(is_loading or self._selected_provider() != LLM_PROVIDER_OLLAMA)
             self._cloud_button.setDisabled(is_loading or self._selected_provider() != LLM_PROVIDER_CLOUD)
+            self._project_rag_button.setDisabled(is_loading)
             self._strategy_combo.setDisabled(is_loading)
             self._branch_combo.setDisabled(is_loading)
             self._checkpoint_button.setDisabled(is_loading)
@@ -496,6 +544,7 @@ def main() -> None:
             if not is_loading:
                 self._update_ollama_controls()
                 self._update_cloud_controls()
+                self._update_project_rag_controls()
                 self._update_branch_controls()
                 self._update_task_state()
 
@@ -589,6 +638,15 @@ def main() -> None:
             is_cloud = self._selected_provider() == LLM_PROVIDER_CLOUD
             self._cloud_button.setVisible(is_cloud)
             self._cloud_button.setDisabled(not is_cloud or self._cloud_worker is not None)
+
+        def _update_project_rag_controls(self) -> None:
+            self._project_rag_button.setDisabled(self._worker is not None)
+
+        def _build_project_rag(self) -> None:
+            if self._worker is not None:
+                return
+
+            self._send_text("/project-rag build")
 
         def _start_ollama(self) -> None:
             if self._selected_provider() != LLM_PROVIDER_OLLAMA:

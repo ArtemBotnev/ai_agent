@@ -124,6 +124,25 @@ class ChatService:
 
         return self._answer_with_summary(current_message)
 
+    def answer_once(self, user_message: str, *, context: str = "") -> ChatResponse:
+        clean_message = user_message.strip()
+        if not clean_message:
+            raise AgentError(AgentErrorCode.EMPTY_MESSAGE)
+
+        current_message = Message(role=USER_ROLE, content=clean_message)
+        current_request_tokens = self._agent.count_tokens([current_message])
+        history_tokens = self._agent.count_tokens([current_message], context=context)
+        answer = self._agent.ask([current_message], context=context)
+        return ChatResponse(
+            text=answer.text,
+            tokens=ChatTokenUsage(
+                current_request=current_request_tokens,
+                history=history_tokens,
+                response=answer.response_tokens,
+            ),
+            duration_seconds=answer.duration_seconds,
+        )
+
     def get_context_strategy(self) -> ContextStrategy:
         return self._context_strategy
 

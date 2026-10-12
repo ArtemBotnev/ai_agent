@@ -52,10 +52,13 @@ from application.memory.invariants_repository import InvariantsRepository
 from application.memory.user_profile_repository import UserProfileRepository
 from application.memory.working_memory_extractor import WorkingMemoryExtractor
 from application.memory.working_memory_repository import WorkingMemoryRepository
+from application.project_help.project_assistant_commands import ProjectAssistantCommandService
+from application.project_help.project_help_service import ProjectHelpService
 from application.summary.conversation_summarizer import ConversationSummarizer
 from application.summary.conversation_summary_repository import ConversationSummaryRepository
 from application.workflow.task_stage_agents import DoneAgent, ExecutionAgent, PlanningAgent, ValidationAgent
 from config.agent_config import load_agent_config
+from config.project_assistant_config import load_project_assistant_config
 from domain.working_memory import WorkingMemory
 from infrastructure.json_branch_repository import JsonBranchRepository
 from infrastructure.json_conversation_summary_repository import JsonConversationSummaryRepository
@@ -708,7 +711,10 @@ def format_agent_error(error: AgentError) -> str:
 def run_chat(chat_service: ChatService) -> None:
     print("Простой CLI-чат с LLM-агентом")
     print("Введите сообщение и нажмите Enter. Для выхода напишите 'exit' или 'quit'.")
-    print("Команды: /provider, /model, /strategy, /clear, /branch, /checkpoint, /new-branch <name>.")
+    print(
+        "Команды: /provider, /model, /strategy, /clear, /branch, /checkpoint, "
+        "/new-branch <name>, /project, /project-rag, /help <вопрос>."
+    )
 
     while True:
         try:
@@ -758,6 +764,18 @@ def handle_command(chat_service: ChatService, command: str) -> ChatService:
 
     if command_name == "/strategy":
         handle_strategy_command(chat_service, command_argument)
+        return chat_service
+
+    if command_name == "/project":
+        handle_project_command()
+        return chat_service
+
+    if command_name == "/project-rag":
+        handle_project_rag_command(command_argument)
+        return chat_service
+
+    if command_name == "/help":
+        handle_project_help_command(chat_service, command_argument)
         return chat_service
 
     if command_name == "/clear":
@@ -901,6 +919,53 @@ def handle_branch_command(chat_service: ChatService, argument: str) -> None:
         return
 
     print(f"Активная ветка: {branches.active_branch_id}.")
+
+
+def handle_project_command() -> None:
+    try:
+        print(build_project_assistant_command_service().project_status_text())
+    except RuntimeError as error:
+        print(f"Ошибка project assistant: {error}")
+
+
+def handle_project_rag_command(argument: str) -> None:
+    try:
+        print(build_project_assistant_command_service().project_rag_text(argument))
+    except RuntimeError as error:
+        print(f"Ошибка project RAG: {error}")
+
+
+def handle_project_help_command(chat_service: ChatService, question: str) -> None:
+    if not question.strip():
+        print("Укажите вопрос: /help <вопрос о проекте>")
+        return
+
+    try:
+        request = build_project_assistant_command_service().prepare_help_request(question)
+        answer = chat_service.answer_once(request.prompt, context=request.context)
+    except AgentError as error:
+        print(f"Ошибка агента: {format_agent_error(error)}", file=sys.stderr)
+        return
+    except RuntimeError as error:
+        print(f"Ошибка project help: {error}")
+        return
+
+    print(f"Агент: {answer.text}")
+    print(
+        "Токены: "
+        f"текущий запрос — {answer.tokens.current_request}, "
+        f"контекст — {answer.tokens.history}, "
+        f"ответ — {answer.tokens.response}, "
+        f"время — {answer.duration_seconds:.2f} с"
+    )
+
+
+def build_project_help_service() -> ProjectHelpService:
+    return ProjectHelpService(load_project_assistant_config())
+
+
+def build_project_assistant_command_service() -> ProjectAssistantCommandService:
+    return ProjectAssistantCommandService(build_project_help_service())
 
 
 def main() -> None:

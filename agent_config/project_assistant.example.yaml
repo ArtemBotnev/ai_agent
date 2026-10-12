@@ -1,0 +1,29 @@
+# Project assistant configuration example.
+# Copy to agent_config/project_assistant.local.yaml and set a real local path.
+
+project_assistant:
+  project_path: /absolute/path/to/project
+  docs_paths:
+    - README.md
+    - project/docs
+  index_file: rag/project_rag_index.sqlite
+
+  mcp:
+    enabled: false
+    server_url: http://localhost:8000
+    timeout_seconds: 10
+
+  embedding:
+    provider: ollama
+    base_url: http://127.0.0.1:11434
+    model: nomic-embed-text
+    batch_size: 16
+    timeout_seconds: 120
+
+  chunking:
+    target_tokens: 500
+    overlap_tokens: 60
+    min_tokens: 40
+
+  retrieval:
+    top_k: 5
