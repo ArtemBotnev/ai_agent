@@ -8,6 +8,54 @@ project_assistant:
     - project/docs
   index_file: rag/project_rag_index.sqlite
 
+  # Source files used by RAG. For code review this can index any text-based project,
+  # while the exclude rules keep runtime folders, binaries, and local secrets out.
+  source:
+    paths:
+      - .
+    exclude_dirs:
+      - .git
+      - .idea
+      - .venv
+      - __pycache__
+      - node_modules
+      - build
+      - dist
+      - rag
+      - history
+    exclude_globs:
+      - "*.local.yaml"
+      - "*.local.yml"
+      - ".env"
+      - "*.env"
+      - "*.sqlite"
+      - "*.db"
+      - "*.png"
+      - "*.jpg"
+      - "*.jpeg"
+      - "*.gif"
+      - "*.webp"
+      - "*.pdf"
+      - "*.zip"
+      - "*.tar"
+      - "*.gz"
+    max_file_bytes: 1000000
+
+  review:
+    max_diff_chars: 30000
+    max_file_chars: 8000
+    top_k: 5
+    language: Russian
+
+  github:
+    enabled: true
+    repository: owner/repo
+    token_env: GITHUB_TOKEN
+    mcp:
+      enabled: false
+      server_url: http://localhost:8001
+      timeout_seconds: 10
+
   mcp:
     enabled: false
     server_url: http://localhost:8000

@@ -329,6 +329,7 @@ class OllamaLlmAgent:
     base_url: str = DEFAULT_OLLAMA_BASE_URL
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     options: OllamaOptions | None = None
+    timeout_seconds: int = 120
     on_event: AgentEventCallback | None = None
 
     def count_tokens(self, messages: Sequence[Message], *, context: str = "") -> int:
@@ -390,7 +391,7 @@ class OllamaLlmAgent:
         )
 
         try:
-            with urlopen(request, timeout=120) as response:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
                 raw_body = response.read().decode("utf-8")
         except HTTPError as error:
             details = error.read().decode("utf-8", errors="replace")

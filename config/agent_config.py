@@ -26,6 +26,7 @@ class ProviderConfig:
 @dataclass(frozen=True)
 class OllamaConfig(ProviderConfig):
     base_url: str | None = None
+    timeout_seconds: int | None = None
     options: dict[str, int | float] = field(default_factory=dict)
 
 
@@ -223,6 +224,7 @@ def _read_ollama_config(raw_provider: object, config_file: Path) -> OllamaConfig
         models=_string_tuple(provider.get("models"), "models"),
         system_prompt_file=_optional_prompt_path(provider, "system_prompt_file", config_file),
         base_url=_optional_str(provider, "base_url"),
+        timeout_seconds=_int_option(provider, "timeout_seconds", name="ollama", minimum=1),
         options=_read_ollama_options(provider.get("options"), "ollama.options"),
     )
 
@@ -237,6 +239,7 @@ def _read_cloud_config(raw_provider: object, config_file: Path) -> CloudConfig:
         models=_string_tuple(provider.get("models"), "models"),
         system_prompt_file=_optional_prompt_path(provider, "system_prompt_file", config_file),
         base_url=_optional_str(provider, "base_url"),
+        timeout_seconds=_int_option(provider, "timeout_seconds", name="cloud", minimum=1),
         options=_read_ollama_options(provider.get("options"), "cloud.options"),
         config_file=_optional_path(provider, "config_file"),
     )

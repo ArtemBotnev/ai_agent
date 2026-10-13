@@ -11,6 +11,4 @@ __pycache__/
 /agent_config/invariants/users/
 /agent_config/llm.local.yaml
 /agent_config/*.local.yaml
-/agent_config/prompts/*
-!/agent_config/prompts/example/
-!/agent_config/prompts/example/**
+/agent_config/prompts/*.local.md

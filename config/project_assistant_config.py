@@ -39,10 +39,67 @@ class ProjectRetrievalConfig:
 
 
 @dataclass(frozen=True)
+class ProjectReviewConfig:
+    max_diff_chars: int = 30_000
+    max_file_chars: int = 8_000
+    top_k: int = 5
+    language: str = "Russian"
+
+
+@dataclass(frozen=True)
+class ProjectSourceConfig:
+    source_paths: tuple[Path, ...] = ()
+    exclude_dirs: tuple[str, ...] = (
+        ".git",
+        ".idea",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+        "build",
+        "dist",
+        "rag",
+        "history",
+    )
+    exclude_globs: tuple[str, ...] = (
+        "*.local.yaml",
+        "*.local.yml",
+        ".env",
+        "*.env",
+        "*.sqlite",
+        "*.db",
+        "*.png",
+        "*.jpg",
+        "*.jpeg",
+        "*.gif",
+        "*.webp",
+        "*.pdf",
+        "*.zip",
+        "*.tar",
+        "*.gz",
+    )
+    max_file_bytes: int = 1_000_000
+
+
+@dataclass(frozen=True)
 class ProjectMcpConfig:
     enabled: bool = False
     server_url: str = "http://localhost:8000"
     timeout_seconds: int = 10
+
+
+@dataclass(frozen=True)
+class GithubMcpConfig:
+    enabled: bool = False
+    server_url: str = "http://localhost:8001"
+    timeout_seconds: int = 10
+
+
+@dataclass(frozen=True)
+class ProjectGithubConfig:
+    enabled: bool = False
+    repository: str = ""
+    token_env: str = "GITHUB_TOKEN"
+    mcp: GithubMcpConfig = GithubMcpConfig()
 
 
 @dataclass(frozen=True)
@@ -54,7 +111,10 @@ class ProjectAssistantConfig:
     embedding: ProjectEmbeddingConfig = ProjectEmbeddingConfig()
     chunking: ProjectChunkingConfig = ProjectChunkingConfig()
     retrieval: ProjectRetrievalConfig = ProjectRetrievalConfig()
+    review: ProjectReviewConfig = ProjectReviewConfig()
+    source: ProjectSourceConfig = ProjectSourceConfig()
     mcp: ProjectMcpConfig = ProjectMcpConfig()
+    github: ProjectGithubConfig = ProjectGithubConfig()
 
     @property
     def resolved_project_path(self) -> Path:
@@ -92,7 +152,10 @@ def load_project_assistant_config() -> ProjectAssistantConfig:
         embedding=_read_embedding_config(project_assistant.get("embedding")),
         chunking=_read_chunking_config(project_assistant.get("chunking")),
         retrieval=_read_retrieval_config(project_assistant.get("retrieval")),
+        review=_read_review_config(project_assistant.get("review")),
+        source=_read_source_config(project_assistant),
         mcp=_read_mcp_config(project_assistant.get("mcp")),
+        github=_read_github_config(project_assistant.get("github")),
     )
 
 
@@ -153,6 +216,41 @@ def _read_retrieval_config(raw_retrieval: object) -> ProjectRetrievalConfig:
     )
 
 
+def _read_review_config(raw_review: object) -> ProjectReviewConfig:
+    review = _optional_mapping(raw_review, "project_assistant.review")
+    if review is None:
+        return ProjectReviewConfig()
+
+    max_diff_chars = _int_option(review, "max_diff_chars", minimum=1)
+    max_file_chars = _int_option(review, "max_file_chars", minimum=1)
+    top_k = _int_option(review, "top_k", minimum=1)
+    return ProjectReviewConfig(
+        max_diff_chars=max_diff_chars if max_diff_chars is not None else 30_000,
+        max_file_chars=max_file_chars if max_file_chars is not None else 8_000,
+        top_k=top_k if top_k is not None else 5,
+        language=_optional_str(review, "language") or "Russian",
+    )
+
+
+def _read_source_config(project_assistant: dict[str, Any]) -> ProjectSourceConfig:
+    raw_source = project_assistant.get("source")
+    source = _optional_mapping(raw_source, "project_assistant.source")
+    legacy_docs_paths = _path_tuple(project_assistant.get("docs_paths"), "project_assistant.docs_paths")
+    default_source_paths = legacy_docs_paths or (Path("README.md"), Path("project/docs"))
+    if source is None:
+        return ProjectSourceConfig(source_paths=default_source_paths)
+
+    max_file_bytes = _int_option(source, "max_file_bytes", minimum=1)
+    return ProjectSourceConfig(
+        source_paths=_path_tuple(source.get("paths"), "project_assistant.source.paths") or default_source_paths,
+        exclude_dirs=_str_tuple(source.get("exclude_dirs"), "project_assistant.source.exclude_dirs")
+        or ProjectSourceConfig.exclude_dirs,
+        exclude_globs=_str_tuple(source.get("exclude_globs"), "project_assistant.source.exclude_globs")
+        or ProjectSourceConfig.exclude_globs,
+        max_file_bytes=max_file_bytes if max_file_bytes is not None else 1_000_000,
+    )
+
+
 def _read_mcp_config(raw_mcp: object) -> ProjectMcpConfig:
     mcp = _optional_mapping(raw_mcp, "project_assistant.mcp")
     if mcp is None:
@@ -162,6 +260,32 @@ def _read_mcp_config(raw_mcp: object) -> ProjectMcpConfig:
     return ProjectMcpConfig(
         enabled=_bool_option(mcp, "enabled") if _bool_option(mcp, "enabled") is not None else False,
         server_url=_optional_str(mcp, "server_url") or "http://localhost:8000",
+        timeout_seconds=timeout_seconds if timeout_seconds is not None else 10,
+    )
+
+
+def _read_github_config(raw_github: object) -> ProjectGithubConfig:
+    github = _optional_mapping(raw_github, "project_assistant.github")
+    if github is None:
+        return ProjectGithubConfig()
+
+    return ProjectGithubConfig(
+        enabled=_bool_option(github, "enabled") if _bool_option(github, "enabled") is not None else False,
+        repository=_optional_str(github, "repository") or "",
+        token_env=_optional_str(github, "token_env") or "GITHUB_TOKEN",
+        mcp=_read_github_mcp_config(github.get("mcp")),
+    )
+
+
+def _read_github_mcp_config(raw_mcp: object) -> GithubMcpConfig:
+    mcp = _optional_mapping(raw_mcp, "project_assistant.github.mcp")
+    if mcp is None:
+        return GithubMcpConfig()
+
+    timeout_seconds = _int_option(mcp, "timeout_seconds", minimum=1)
+    return GithubMcpConfig(
+        enabled=_bool_option(mcp, "enabled") if _bool_option(mcp, "enabled") is not None else False,
+        server_url=_optional_str(mcp, "server_url") or "http://localhost:8001",
         timeout_seconds=timeout_seconds if timeout_seconds is not None else 10,
     )
 
@@ -206,6 +330,23 @@ def _path_tuple(value: object, key: str) -> tuple[Path, ...]:
         raise RuntimeError(f"Значение {key} должно быть списком строк.")
 
     return tuple(Path(item) for item in items if item)
+
+
+def _str_tuple(value: object, key: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",")]
+    elif isinstance(value, list):
+        items = []
+        for item in value:
+            if not isinstance(item, str):
+                raise RuntimeError(f"Список {key} должен содержать только строки.")
+            items.append(item.strip())
+    else:
+        raise RuntimeError(f"Значение {key} должно быть списком строк.")
+
+    return tuple(item for item in items if item)
 
 
 def _int_option(mapping: dict[str, Any], key: str, *, minimum: int | None = None) -> int | None:

@@ -14,6 +14,10 @@ ollama:
   # Examples: llama3.1:8b, qwen2.5:7b, codellama:7b, custom-agent-q4.
   model: llama3.1:8b
 
+  # HTTP timeout for non-streaming Ollama chat requests.
+  # PR review can need several minutes on local models.
+  timeout_seconds: 600
+
   # Models shown in CLI/UI for this provider.
   # Include normal and quantized variants if available.
   models:
@@ -98,6 +102,9 @@ cloud:
 
   # Active cloud model.
   model: my-llama
+
+  # HTTP timeout for Ollama-compatible cloud chat requests.
+  timeout_seconds: 600
 
   # Models shown in CLI/UI for this provider.
   # If the cloud API later exposes model discovery, this can stay as fallback.

@@ -1,0 +1,16 @@
+name: AI Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    uses: ArtemBotnev/ai_agent/.github/workflows/ai-code-review.yml@task-32
+    with:
+      reviewer_repository: ArtemBotnev/ai_agent
+      reviewer_ref: task-32

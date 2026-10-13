@@ -23,6 +23,7 @@ AI Second is a Python CLI and PyQt assistant project. It supports OpenAI, local 
 - `/branch`, `/checkpoint`, and `/new-branch <name>` manage conversation branches.
 - `/project` shows the configured project assistant target and current git branch.
 - `/project-rag build` builds a local RAG index from project documentation.
+- `scripts/review_pr.py` reviews a pull request diff with RAG and the active LLM provider.
 - `/project-rag status` shows the current project RAG index status.
 - `/help <question>` answers questions about the connected project using the RAG index and project context.
 
@@ -39,10 +40,38 @@ The UI also has a `Собрать RAG` button that runs `/project-rag build`.
 
 The project assistant reads its private runtime configuration from `agent_config/project_assistant.local.yaml`. The committed example is `agent_config/project_assistant.example.yaml`.
 
-The configured `project_path` points to the local repository being documented. By default the RAG source paths are `README.md` and `project/docs`. Embeddings are created through Ollama using the configured embedding model. The SQLite RAG index is stored outside chat history, under `rag/project_rag_index.sqlite`.
+The configured `project_path` points to the local repository being documented or reviewed. By default the RAG source paths can cover the whole text-based project through `source.paths`, while `source.exclude_dirs` and `source.exclude_globs` keep runtime folders, binaries, generated artifacts, and local secrets out. Embeddings are created through Ollama using the configured embedding model. The SQLite RAG index is stored outside chat history, under `rag/project_rag_index.sqlite`.
 
 When `project_assistant.mcp.enabled` is `true`, project context such as the current git branch is loaded through the configured MCP Streamable HTTP server. The example MCP URL is `http://localhost:8000`.
 
 Use `scripts/start_project_ollama.sh` to start Ollama and pull the configured embedding model before running `/project-rag build`.
 
 The local project context adapter currently exposes the current git branch. It is intentionally isolated so it can later be replaced by a real MCP client without changing `/help` and RAG command behavior.
+
+## AI Code Review
+
+`scripts/review_pr.py` is a CI-friendly entry point for pull request review. It accepts a target repository path plus base/head refs or SHAs, builds the project RAG index, retrieves relevant project context, sends the PR diff to the active LLM provider, and writes a Markdown review.
+
+For the full GitHub setup, including what to add to the reviewed repository and how to run a self-hosted runner, see `project/docs/github_ai_review_setup.md`.
+
+Local example:
+
+```bash
+python scripts/review_pr.py \
+  --project-path /path/to/target-repo \
+  --base-ref origin/main \
+  --head-ref HEAD \
+  --output pr_review.md
+```
+
+For GitHub, use the workflow in `.github/workflows/ai-code-review.yml` as a reusable self-hosted runner pipeline. In another repository, call this reviewer repository from a small workflow:
+
+```yaml
+jobs:
+  ai-review:
+    uses: your-org/ai_second/.github/workflows/ai-code-review.yml@main
+    with:
+      reviewer_repository: your-org/ai_second
+```
+
+The workflow checks out the target repository and the reviewer repository separately, starts Ollama for embeddings, runs `scripts/review_pr.py` against the target repository, publishes the Markdown review to the job summary, and updates a PR comment.

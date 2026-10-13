@@ -59,6 +59,7 @@ python -m ui.pyqt_app
 - `/project-rag build` собирает SQLite RAG-индекс по документации проекта.
 - `/project-rag status` показывает статус RAG-индекса.
 - `/help <вопрос>` отвечает на вопросы о подключенном проекте через RAG и project context.
+- `scripts/review_pr.py` делает AI-ревью PR diff через RAG и текущий LLM provider.
 
 ## PyQt UI
 
@@ -95,12 +96,16 @@ agent_config/project_assistant.example.yaml
 
 - `project_path` — путь к локальному репозиторию, про который ассистент должен отвечать.
 - `docs_paths` — список файлов или папок документации относительно `project_path`.
+- `source.paths` — список файлов или папок, которые входят в RAG; для ревью можно указать весь проект через `.`.
+- `source.exclude_dirs` и `source.exclude_globs` — исключения для runtime-папок, бинарников, артефактов и локальных секретов.
 - `index_file` — путь к SQLite RAG-индексу.
 - `mcp.enabled` — включает получение project context через MCP.
 - `mcp.server_url` — адрес MCP Streamable HTTP server.
+- `github.mcp` — отдельная секция для будущего GitHub MCP, не заменяет локальный `mcp`.
 - `embedding.provider` — provider для embeddings, обычно `ollama`.
 - `embedding.model` — embedding-модель Ollama, например `nomic-embed-text`.
 - `retrieval.top_k` — сколько чанков документации передавать в `/help`.
+- `review.*` — лимиты diff/file context и язык ответа для AI-ревью.
 
 По умолчанию RAG-индекс хранится отдельно от истории чата:
 
@@ -135,13 +140,41 @@ mcp:
 
 Что происходит:
 
-1. Ассистент читает `README.md` и `project/docs` выбранного проекта.
+1. Ассистент читает настроенные `source.paths` выбранного проекта.
 2. Документы режутся на чанки.
 3. Чанки отправляются в Ollama embedding API.
 4. Embeddings и тексты сохраняются в SQLite.
 5. Команда `/help` ищет релевантные чанки и передает их выбранной LLM.
 
 RAG находится на стороне агента. MCP не строит embeddings и не вызывает LLM.
+
+## AI Code Review
+
+Для ревью PR добавлен CI entry point:
+
+Полная инструкция для GitHub, включая файл в проверяемом репозитории и запуск self-hosted runner, описана в `project/docs/github_ai_review_setup.ru.md`.
+
+```bash
+python scripts/review_pr.py \
+  --project-path /path/to/target-repo \
+  --base-ref origin/main \
+  --head-ref HEAD \
+  --output pr_review.md
+```
+
+Скрипт получает diff через git, строит RAG по проверяемому проекту, достает релевантный контекст и отправляет одноразовый запрос в LLM. Результат — Markdown review с потенциальными багами, архитектурными замечаниями и рекомендациями.
+
+Для GitHub используется workflow `.github/workflows/ai-code-review.yml`. Он рассчитан на вариант, где `ai_second` живет как отдельный reviewer repository, а проверяемый репозиторий вызывает его:
+
+```yaml
+jobs:
+  ai-review:
+    uses: your-org/ai_second/.github/workflows/ai-code-review.yml@main
+    with:
+      reviewer_repository: your-org/ai_second
+```
+
+Workflow запускается на PR, checkout-ит проверяемый repo и repo ассистента, запускает Ollama embeddings, выполняет `scripts/review_pr.py`, пишет результат в job summary и обновляет комментарий в PR.
 
 ## Конфиги
 

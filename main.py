@@ -96,6 +96,7 @@ OLLAMA_TOP_K_ENV = "AGENT_OLLAMA_TOP_K"
 OLLAMA_TOP_P_ENV = "AGENT_OLLAMA_TOP_P"
 OLLAMA_REPEAT_PENALTY_ENV = "AGENT_OLLAMA_REPEAT_PENALTY"
 OLLAMA_SEED_ENV = "AGENT_OLLAMA_SEED"
+OLLAMA_TIMEOUT_SECONDS_ENV = "AGENT_OLLAMA_TIMEOUT_SECONDS"
 CLOUD_BASE_URL_ENV = "AGENT_CLOUD_URL"
 CLOUD_MODEL_ENV = "AGENT_CLOUD_MODEL"
 CLOUD_MODELS_ENV = "AGENT_CLOUD_MODELS"
@@ -135,6 +136,7 @@ def build_llm_agent(
             base_url=get_ollama_compatible_base_url(selected_provider),
             system_prompt=system_prompt or get_provider_system_prompt(selected_provider),
             options=get_ollama_compatible_options(selected_provider),
+            timeout_seconds=get_ollama_compatible_timeout_seconds(selected_provider),
         )
 
     return SimpleLlmAgent(
@@ -347,6 +349,23 @@ def get_ollama_compatible_options(provider: str) -> OllamaOptions | None:
         return get_cloud_options()
 
     return get_ollama_options()
+
+
+def get_ollama_compatible_timeout_seconds(provider: str) -> int:
+    raw_timeout = os.getenv(OLLAMA_TIMEOUT_SECONDS_ENV)
+    if raw_timeout is not None and raw_timeout.strip():
+        try:
+            timeout_seconds = int(raw_timeout)
+        except ValueError as error:
+            raise RuntimeError(f"Переменная {OLLAMA_TIMEOUT_SECONDS_ENV} должна быть целым числом.") from error
+        if timeout_seconds < 1:
+            raise RuntimeError(f"Переменная {OLLAMA_TIMEOUT_SECONDS_ENV} должна быть >= 1.")
+        return timeout_seconds
+
+    config = load_agent_config()
+    if provider == LLM_PROVIDER_CLOUD:
+        return config.cloud.timeout_seconds or 120
+    return config.ollama.timeout_seconds or 120
 
 
 def get_available_model_names(provider: str | None = None) -> list[str]:

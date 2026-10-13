@@ -2,26 +2,15 @@ import sqlite3
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from fnmatch import fnmatch
 from pathlib import Path
 
 from application.project_help.embeddings import EmbeddingClient, cosine_similarity
 from application.project_help.tokenizer import slice_by_token_range, token_count
-from config.project_assistant_config import ProjectAssistantConfig
+from config.project_assistant_config import ProjectAssistantConfig, ProjectSourceConfig
 
 
-SUPPORTED_DOC_SUFFIXES = {
-    ".md",
-    ".markdown",
-    ".txt",
-    ".yaml",
-    ".yml",
-    ".json",
-    ".toml",
-    ".proto",
-}
-EXCLUDED_DIR_NAMES = {".git", ".idea", ".venv", "__pycache__", "node_modules", "build", "dist"}
-EXCLUDED_FILE_SUFFIXES = {".local.yaml", ".local.yml", ".env"}
-MAX_TEXT_FILE_BYTES = 1_000_000
+BINARY_SAMPLE_BYTES = 4096
 
 
 @dataclass(frozen=True)
@@ -82,9 +71,9 @@ class ProjectRagIndex:
         if not project_path.exists() or not project_path.is_dir():
             raise RuntimeError(f"Project path does not exist or is not a directory: {project_path}")
 
-        documents = load_project_documents(project_path, self.config.docs_paths)
+        documents = load_project_documents(project_path, self.config.source)
         if not documents:
-            raise RuntimeError(f"No supported documentation files found for project: {project_path}")
+            raise RuntimeError(f"No supported text files found for project: {project_path}")
 
         chunks = [
             chunk
@@ -93,7 +82,7 @@ class ProjectRagIndex:
             if chunk.token_count >= self.config.chunking.min_tokens
         ]
         if not chunks:
-            raise RuntimeError("Documentation files were found, but no chunks were produced.")
+            raise RuntimeError("Text files were found, but no chunks were produced.")
 
         embeddings = self.embedding_client.embed_all(chunk.text for chunk in chunks)
         if len(embeddings) != len(chunks):
@@ -152,41 +141,52 @@ class ProjectRagIndex:
         return scored[:limit]
 
 
-def load_project_documents(project_path: Path, docs_paths: tuple[Path, ...]) -> list[SourceDocument]:
+def load_project_documents(project_path: Path, source_config: ProjectSourceConfig) -> list[SourceDocument]:
     documents: list[SourceDocument] = []
-    for configured_path in docs_paths or (Path("README.md"), Path("project/docs")):
+    seen_paths: set[Path] = set()
+    for configured_path in source_config.source_paths or (Path("README.md"), Path("project/docs")):
         absolute_path = _resolve_inside_project(project_path, configured_path)
         if absolute_path.is_file():
-            document = load_document(absolute_path, project_path)
+            if absolute_path in seen_paths:
+                continue
+            seen_paths.add(absolute_path)
+            document = load_document(absolute_path, project_path, source_config)
             if document is not None:
                 documents.append(document)
             continue
         if absolute_path.is_dir():
             for path in sorted(absolute_path.rglob("*")):
-                if path.is_file() and should_include(path, project_path):
-                    document = load_document(path, project_path)
+                if path in seen_paths:
+                    continue
+                if path.is_file() and should_include(path, project_path, source_config):
+                    seen_paths.add(path)
+                    document = load_document(path, project_path, source_config)
                     if document is not None:
                         documents.append(document)
     return documents
 
 
-def should_include(path: Path, project_path: Path) -> bool:
+def should_include(path: Path, project_path: Path, source_config: ProjectSourceConfig) -> bool:
     try:
-        relative_parts = path.relative_to(project_path).parts
+        relative_path = path.relative_to(project_path)
     except ValueError:
         return False
-    if any(part in EXCLUDED_DIR_NAMES for part in relative_parts):
+    relative_parts = relative_path.parts
+    if any(part in source_config.exclude_dirs for part in relative_parts):
         return False
-    name = path.name.lower()
-    if any(name.endswith(suffix) for suffix in EXCLUDED_FILE_SUFFIXES):
+    relative_posix = relative_path.as_posix()
+    if any(fnmatch(relative_posix, pattern) or fnmatch(path.name, pattern) for pattern in source_config.exclude_globs):
         return False
-    if path.suffix.lower() not in SUPPORTED_DOC_SUFFIXES:
+    try:
+        if path.stat().st_size > source_config.max_file_bytes:
+            return False
+    except OSError:
         return False
-    return path.stat().st_size <= MAX_TEXT_FILE_BYTES
+    return is_text_file(path)
 
 
-def load_document(path: Path, project_path: Path) -> SourceDocument | None:
-    if not should_include(path, project_path):
+def load_document(path: Path, project_path: Path, source_config: ProjectSourceConfig) -> SourceDocument | None:
+    if not should_include(path, project_path, source_config):
         return None
     text = path.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
@@ -377,7 +377,37 @@ def content_type_for(path: Path) -> str:
         return "TOML"
     if suffix == ".proto":
         return "PROTO"
+    if suffix in {".py", ".pyi"}:
+        return "PYTHON"
+    if suffix in {".js", ".jsx", ".mjs", ".cjs"}:
+        return "JAVASCRIPT"
+    if suffix in {".ts", ".tsx"}:
+        return "TYPESCRIPT"
+    if suffix in {".go"}:
+        return "GO"
+    if suffix in {".java", ".kt", ".kts"}:
+        return "JVM"
+    if suffix in {".rs"}:
+        return "RUST"
+    if suffix in {".c", ".h", ".cpp", ".hpp", ".cc", ".hh"}:
+        return "CPP"
+    if suffix in {".sh", ".bash", ".zsh"}:
+        return "SHELL"
     return "TEXT"
+
+
+def is_text_file(path: Path) -> bool:
+    try:
+        sample = path.read_bytes()[:BINARY_SAMPLE_BYTES]
+    except OSError:
+        return False
+    if b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
 
 
 def _resolve_inside_project(project_path: Path, configured_path: Path) -> Path:
@@ -388,5 +418,5 @@ def _resolve_inside_project(project_path: Path, configured_path: Path) -> Path:
     try:
         resolved_path.relative_to(project_path)
     except ValueError as error:
-        raise RuntimeError(f"Documentation path is outside project: {configured_path}") from error
+        raise RuntimeError(f"Project source path is outside project: {configured_path}") from error
     return resolved_path
