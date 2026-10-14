@@ -13,6 +13,7 @@ from application.chat.agent_error import AgentError
 from application.chat.chat_service import ChatResponse, ChatTokenUsage
 from application.chat.context_strategy import ContextStrategy
 from application.project_help.project_assistant_commands import parse_project_assistant_command
+from application.support.support_assistant_commands import parse_support_assistant_command
 from domain.conversation_branch import ConversationBranch, ConversationBranches
 from domain.conversation_summary import ConversationSummary
 from domain.long_term_memory import LongTermMemory
@@ -26,6 +27,7 @@ from main import (
     build_branch_repository,
     build_facts_repository,
     build_project_assistant_command_service,
+    build_support_assistant_command_service,
     get_cloud_base_url,
     get_ollama_base_url,
     get_llm_provider,
@@ -62,6 +64,7 @@ def main() -> None:
             QHBoxLayout,
             QInputDialog,
             QLabel,
+            QLineEdit,
             QMainWindow,
             QMessageBox,
             QPushButton,
@@ -111,13 +114,27 @@ def main() -> None:
         def run(self) -> None:
             try:
                 command = parse_project_assistant_command(self._message)
-                if command is None:
+                support_command = parse_support_assistant_command(self._message)
+                if command is None and support_command is None:
                     response = self._build_chat_service().answer(self._message)
-                elif command.name == "/help":
+                elif command is not None and command.name == "/help":
                     chat_service = self._build_chat_service()
                     response = self._answer_project_assistant_command(command.name, command.argument, chat_service)
-                else:
+                elif command is not None:
                     response = self._answer_project_assistant_command(command.name, command.argument, None)
+                elif support_command.name == "/support":
+                    chat_service = self._build_chat_service()
+                    response = self._answer_support_assistant_command(
+                        support_command.name,
+                        support_command.argument,
+                        chat_service,
+                    )
+                else:
+                    response = self._answer_support_assistant_command(
+                        support_command.name,
+                        support_command.argument,
+                        None,
+                    )
             except RuntimeError as error:
                 self.failed.emit(str(error))
             except AgentError as error:
@@ -152,6 +169,29 @@ def main() -> None:
                 return chat_service.answer_once(request.prompt, context=request.context)
 
             return self._text_response("Неизвестная команда project assistant.")
+
+        def _answer_support_assistant_command(
+            self,
+            name: str,
+            argument: str,
+            chat_service: Any | None,
+        ) -> ChatResponse:
+            command_service = build_support_assistant_command_service()
+            if name == "/support-rag":
+                return self._text_response(command_service.support_rag_text(argument))
+            if name == "/support-clear":
+                return self._text_response(command_service.clear_support_data_text())
+            if name == "/support":
+                if not argument.strip():
+                    return self._text_response(command_service.support_status_text())
+                if chat_service is None:
+                    raise RuntimeError("LLM service is required for /support.")
+                request = command_service.prepare_support_request(argument)
+                if request.direct_answer is not None:
+                    return self._text_response(request.direct_answer)
+                return chat_service.answer_once(request.prompt, context=request.context)
+
+            return self._text_response("Неизвестная команда support assistant.")
 
         def _text_response(self, text: str) -> ChatResponse:
             return ChatResponse(
@@ -344,13 +384,17 @@ def main() -> None:
             self._user_combo = QComboBox()
             self._provider_combo = QComboBox()
             self._model_combo = QComboBox()
+            self._mode_combo = QComboBox()
+            self._support_ticket_label = QLabel("Тикет:")
+            self._support_ticket_input = QLineEdit()
             self._status_label = QLabel("Готов")
             self._task_state_label = QLabel()
             self._strategy_combo = QComboBox()
             self._branch_combo = QComboBox()
             self._ollama_button = QPushButton("Запустить Ollama")
             self._cloud_button = QPushButton("Проверить облако")
-            self._project_rag_button = QPushButton("Собрать RAG")
+            self._project_rag_button = QPushButton("Project RAG")
+            self._support_rag_button = QPushButton("Support RAG")
             self._checkpoint_button = QPushButton("Checkpoint")
             self._new_branch_button = QPushButton("Новая ветка")
             self._clear_button = QPushButton("Очистить")
@@ -373,8 +417,14 @@ def main() -> None:
             self._ollama_button.setFixedHeight(36)
             self._cloud_button.setFixedHeight(36)
             self._project_rag_button.setFixedHeight(36)
+            self._support_rag_button.setFixedHeight(36)
             self._checkpoint_button.setFixedHeight(36)
             self._new_branch_button.setFixedHeight(36)
+            self._support_ticket_input.setPlaceholderText("тикет опционально")
+            self._support_ticket_input.setFixedWidth(150)
+
+            self._mode_combo.addItem("Чат", "chat")
+            self._mode_combo.addItem("Support", "support")
 
             user_ids = get_available_user_ids()
             for user_id in user_ids:
@@ -406,10 +456,12 @@ def main() -> None:
             self._user_combo.currentIndexChanged.connect(self._handle_user_changed)
             self._provider_combo.currentIndexChanged.connect(self._handle_provider_changed)
             self._strategy_combo.currentIndexChanged.connect(self._handle_strategy_changed)
+            self._mode_combo.currentIndexChanged.connect(self._handle_mode_changed)
             self._branch_combo.currentIndexChanged.connect(self._handle_branch_changed)
             self._ollama_button.clicked.connect(self._start_ollama)
             self._cloud_button.clicked.connect(self._check_cloud)
             self._project_rag_button.clicked.connect(self._build_project_rag)
+            self._support_rag_button.clicked.connect(self._refresh_support_rag)
             self._checkpoint_button.clicked.connect(self._save_checkpoint)
             self._new_branch_button.clicked.connect(self._create_branch)
 
@@ -426,6 +478,12 @@ def main() -> None:
             header_layout.addWidget(self._ollama_button)
             header_layout.addWidget(self._cloud_button)
             header_layout.addWidget(self._project_rag_button)
+            header_layout.addWidget(self._support_rag_button)
+            header_layout.addSpacing(16)
+            header_layout.addWidget(QLabel("Режим:"))
+            header_layout.addWidget(self._mode_combo)
+            header_layout.addWidget(self._support_ticket_label)
+            header_layout.addWidget(self._support_ticket_input)
             header_layout.addSpacing(16)
             header_layout.addWidget(QLabel("Стратегия:"))
             header_layout.addWidget(self._strategy_combo)
@@ -453,6 +511,7 @@ def main() -> None:
             self._update_ollama_controls()
             self._update_cloud_controls()
             self._update_project_rag_controls()
+            self._update_support_controls()
             self._update_branch_controls()
             self._update_task_state()
 
@@ -478,11 +537,17 @@ def main() -> None:
                 self._append_message(ERROR_AUTHOR, "Введите непустое сообщение.")
                 return
 
-            self._send_text(text)
+            try:
+                worker_text, display_text = self._message_for_current_mode(text)
+            except RuntimeError as error:
+                self._append_message(ERROR_AUTHOR, str(error))
+                return
+
+            self._send_text(worker_text, display_text)
             self._input.clear()
 
-        def _send_text(self, text: str) -> None:
-            self._append_message(USER_AUTHOR, text)
+        def _send_text(self, text: str, display_text: str | None = None) -> None:
+            self._append_message(USER_AUTHOR, display_text or text)
             self._set_loading(True)
 
             self._worker = ChatWorker(
@@ -532,9 +597,12 @@ def main() -> None:
             self._user_combo.setDisabled(is_loading)
             self._provider_combo.setDisabled(is_loading)
             self._model_combo.setDisabled(is_loading)
+            self._mode_combo.setDisabled(is_loading)
+            self._support_ticket_input.setDisabled(is_loading or self._selected_mode() != "support")
             self._ollama_button.setDisabled(is_loading or self._selected_provider() != LLM_PROVIDER_OLLAMA)
             self._cloud_button.setDisabled(is_loading or self._selected_provider() != LLM_PROVIDER_CLOUD)
             self._project_rag_button.setDisabled(is_loading)
+            self._support_rag_button.setDisabled(is_loading)
             self._strategy_combo.setDisabled(is_loading)
             self._branch_combo.setDisabled(is_loading)
             self._checkpoint_button.setDisabled(is_loading)
@@ -545,6 +613,7 @@ def main() -> None:
                 self._update_ollama_controls()
                 self._update_cloud_controls()
                 self._update_project_rag_controls()
+                self._update_support_controls()
                 self._update_branch_controls()
                 self._update_task_state()
 
@@ -590,6 +659,21 @@ def main() -> None:
 
             return get_user_id()
 
+        def _selected_mode(self) -> str:
+            mode = self._mode_combo.currentData()
+            return mode if isinstance(mode, str) else "chat"
+
+        def _message_for_current_mode(self, text: str) -> tuple[str, str]:
+            if text.startswith("/"):
+                return text, text
+            if self._selected_mode() != "support":
+                return text, text
+
+            ticket_id = self._support_ticket_input.text().strip()
+            if not ticket_id:
+                return f"/support {text}", f"[Support] {text}"
+            return f"/support {ticket_id} {text}", f"[Support {ticket_id}] {text}"
+
         def _load_messages_for_current_strategy(self) -> list[Message]:
             if self._selected_strategy() == ContextStrategy.BRANCHING:
                 return build_branch_repository().load().active_branch.messages
@@ -600,6 +684,9 @@ def main() -> None:
             self._update_branch_controls()
             self._update_task_state()
             self._load_history()
+
+        def _handle_mode_changed(self, *_args: Any) -> None:
+            self._update_support_controls()
 
         def _handle_user_changed(self, *_args: Any) -> None:
             self._update_branch_controls()
@@ -642,11 +729,25 @@ def main() -> None:
         def _update_project_rag_controls(self) -> None:
             self._project_rag_button.setDisabled(self._worker is not None)
 
+        def _update_support_controls(self) -> None:
+            is_support = self._selected_mode() == "support"
+            self._support_ticket_label.setVisible(is_support)
+            self._support_ticket_input.setVisible(is_support)
+            self._support_rag_button.setVisible(is_support)
+            self._support_ticket_input.setDisabled(self._worker is not None or not is_support)
+            self._support_rag_button.setDisabled(self._worker is not None or not is_support)
+
         def _build_project_rag(self) -> None:
             if self._worker is not None:
                 return
 
             self._send_text("/project-rag build")
+
+        def _refresh_support_rag(self) -> None:
+            if self._worker is not None:
+                return
+
+            self._send_text("/support-rag refresh", "Support RAG refresh")
 
         def _start_ollama(self) -> None:
             if self._selected_provider() != LLM_PROVIDER_OLLAMA:

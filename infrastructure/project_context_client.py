@@ -68,6 +68,9 @@ class McpProjectContextClient:
             return branch.strip()
         raise RuntimeError(f"MCP get_git_branch returned no branch: {result}")
 
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        return self._call_tool(name, arguments)
+
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self._ensure_initialized()
         response = self._post_json(

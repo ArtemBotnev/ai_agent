@@ -54,11 +54,13 @@ from application.memory.working_memory_extractor import WorkingMemoryExtractor
 from application.memory.working_memory_repository import WorkingMemoryRepository
 from application.project_help.project_assistant_commands import ProjectAssistantCommandService
 from application.project_help.project_help_service import ProjectHelpService
+from application.support.support_assistant_commands import SupportAssistantCommandService
 from application.summary.conversation_summarizer import ConversationSummarizer
 from application.summary.conversation_summary_repository import ConversationSummaryRepository
 from application.workflow.task_stage_agents import DoneAgent, ExecutionAgent, PlanningAgent, ValidationAgent
 from config.agent_config import load_agent_config
 from config.project_assistant_config import load_project_assistant_config
+from config.support_assistant_config import load_support_assistant_config
 from domain.working_memory import WorkingMemory
 from infrastructure.json_branch_repository import JsonBranchRepository
 from infrastructure.json_conversation_summary_repository import JsonConversationSummaryRepository
@@ -732,7 +734,8 @@ def run_chat(chat_service: ChatService) -> None:
     print("Введите сообщение и нажмите Enter. Для выхода напишите 'exit' или 'quit'.")
     print(
         "Команды: /provider, /model, /strategy, /clear, /branch, /checkpoint, "
-        "/new-branch <name>, /project, /project-rag, /help <вопрос>."
+        "/new-branch <name>, /project, /project-rag, /help <вопрос>, "
+        "/support, /support-rag, /support-clear, /support [тикет] <вопрос>."
     )
 
     while True:
@@ -795,6 +798,18 @@ def handle_command(chat_service: ChatService, command: str) -> ChatService:
 
     if command_name == "/help":
         handle_project_help_command(chat_service, command_argument)
+        return chat_service
+
+    if command_name == "/support":
+        handle_support_command(chat_service, command_argument)
+        return chat_service
+
+    if command_name == "/support-rag":
+        handle_support_rag_command(command_argument)
+        return chat_service
+
+    if command_name == "/support-clear":
+        handle_support_clear_command()
         return chat_service
 
     if command_name == "/clear":
@@ -979,12 +994,58 @@ def handle_project_help_command(chat_service: ChatService, question: str) -> Non
     )
 
 
+def handle_support_command(chat_service: ChatService, argument: str) -> None:
+    try:
+        command_service = build_support_assistant_command_service()
+        if not argument.strip():
+            print(command_service.support_status_text())
+            return
+        request = command_service.prepare_support_request(argument)
+        if request.direct_answer is not None:
+            print(f"Агент: {request.direct_answer}")
+            return
+        answer = chat_service.answer_once(request.prompt, context=request.context)
+    except AgentError as error:
+        print(f"Ошибка агента: {format_agent_error(error)}", file=sys.stderr)
+        return
+    except RuntimeError as error:
+        print(f"Ошибка support assistant: {error}")
+        return
+
+    print(f"Агент: {answer.text}")
+    print(
+        "Токены: "
+        f"текущий запрос — {answer.tokens.current_request}, "
+        f"контекст — {answer.tokens.history}, "
+        f"ответ — {answer.tokens.response}, "
+        f"время — {answer.duration_seconds:.2f} с"
+    )
+
+
+def handle_support_rag_command(argument: str) -> None:
+    try:
+        print(build_support_assistant_command_service().support_rag_text(argument))
+    except RuntimeError as error:
+        print(f"Ошибка support RAG: {error}")
+
+
+def handle_support_clear_command() -> None:
+    try:
+        print(build_support_assistant_command_service().clear_support_data_text())
+    except RuntimeError as error:
+        print(f"Ошибка support clear: {error}")
+
+
 def build_project_help_service() -> ProjectHelpService:
     return ProjectHelpService(load_project_assistant_config())
 
 
 def build_project_assistant_command_service() -> ProjectAssistantCommandService:
     return ProjectAssistantCommandService(build_project_help_service())
+
+
+def build_support_assistant_command_service() -> SupportAssistantCommandService:
+    return SupportAssistantCommandService(load_support_assistant_config())
 
 
 def main() -> None:

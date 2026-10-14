@@ -1,0 +1,18 @@
+# Support assistant configuration example.
+# Copy to agent_config/support_assistant.local.yaml and set a real product/support project path.
+
+support_assistant:
+  # Project or product repository used as the RAG knowledge base.
+  project_path: /absolute/path/to/product-or-support-project
+
+  # Documentation paths are sent to the MCP server for server-side RAG indexing.
+  docs_paths:
+    - README.md
+    - docs
+    - support/faq
+
+  top_k: 5
+
+  mcp:
+    server_url: http://127.0.0.1:8000
+    timeout_seconds: 10
