@@ -14,6 +14,7 @@ from application.chat.chat_service import ChatResponse, ChatTokenUsage
 from application.chat.context_strategy import ContextStrategy
 from application.project_help.project_assistant_commands import parse_project_assistant_command
 from application.support.support_assistant_commands import parse_support_assistant_command
+from application.workspace.workspace_assistant_commands import parse_workspace_assistant_command, workspace_intent_for_text
 from domain.conversation_branch import ConversationBranch, ConversationBranches
 from domain.conversation_summary import ConversationSummary
 from domain.long_term_memory import LongTermMemory
@@ -28,6 +29,7 @@ from main import (
     build_facts_repository,
     build_project_assistant_command_service,
     build_support_assistant_command_service,
+    build_workspace_assistant_command_service,
     get_cloud_base_url,
     get_ollama_base_url,
     get_llm_provider,
@@ -66,10 +68,12 @@ def main() -> None:
             QLabel,
             QLineEdit,
             QMainWindow,
+            QMenu,
             QMessageBox,
             QPushButton,
             QTextBrowser,
             QTextEdit,
+            QToolButton,
             QVBoxLayout,
             QWidget,
         )
@@ -115,24 +119,38 @@ def main() -> None:
             try:
                 command = parse_project_assistant_command(self._message)
                 support_command = parse_support_assistant_command(self._message)
-                if command is None and support_command is None:
+                workspace_command = parse_workspace_assistant_command(self._message)
+                if command is None and support_command is None and workspace_command is None:
                     response = self._build_chat_service().answer(self._message)
                 elif command is not None and command.name == "/help":
                     chat_service = self._build_chat_service()
                     response = self._answer_project_assistant_command(command.name, command.argument, chat_service)
                 elif command is not None:
                     response = self._answer_project_assistant_command(command.name, command.argument, None)
-                elif support_command.name == "/support":
+                elif support_command is not None and support_command.name == "/support":
                     chat_service = self._build_chat_service()
                     response = self._answer_support_assistant_command(
                         support_command.name,
                         support_command.argument,
                         chat_service,
                     )
-                else:
+                elif support_command is not None:
                     response = self._answer_support_assistant_command(
                         support_command.name,
                         support_command.argument,
+                        None,
+                    )
+                elif workspace_command is not None and workspace_command.name in {"/workspace", "/workspace-edit"}:
+                    chat_service = self._build_chat_service()
+                    response = self._answer_workspace_assistant_command(
+                        workspace_command.name,
+                        workspace_command.argument,
+                        chat_service,
+                    )
+                else:
+                    response = self._answer_workspace_assistant_command(
+                        workspace_command.name,
+                        workspace_command.argument,
                         None,
                     )
             except RuntimeError as error:
@@ -166,7 +184,7 @@ def main() -> None:
                 if chat_service is None:
                     raise RuntimeError("LLM service is required for /help.")
                 request = command_service.prepare_help_request(argument)
-                return chat_service.answer_once(request.prompt, context=request.context)
+                return chat_service.answer_with_context(request.prompt, context=request.context)
 
             return self._text_response("Неизвестная команда project assistant.")
 
@@ -189,9 +207,53 @@ def main() -> None:
                 request = command_service.prepare_support_request(argument)
                 if request.direct_answer is not None:
                     return self._text_response(request.direct_answer)
-                return chat_service.answer_once(request.prompt, context=request.context)
+                return chat_service.answer_with_context(request.prompt, context=request.context)
 
             return self._text_response("Неизвестная команда support assistant.")
+
+        def _answer_workspace_assistant_command(
+            self,
+            name: str,
+            argument: str,
+            chat_service: Any | None,
+        ) -> ChatResponse:
+            command_service = build_workspace_assistant_command_service()
+            if name == "/workspace":
+                request = command_service.prepare_workspace_request(argument)
+                if request.direct_answer is not None:
+                    return self._text_response(request.direct_answer)
+                if chat_service is None:
+                    raise RuntimeError("LLM service is required for /workspace.")
+                return chat_service.answer_with_context(request.prompt, context=request.context)
+            if name == "/workspace-edit":
+                if chat_service is None:
+                    raise RuntimeError("LLM service is required for /workspace-edit.")
+                request = command_service.prepare_workspace_edit_request(argument)
+                if request.direct_answer is not None:
+                    answer = self._text_response(request.direct_answer)
+                else:
+                    answer = chat_service.answer_with_context(
+                        request.prompt,
+                        context=request.context,
+                        saved_user_message=request.history_message,
+                        save_to_history=False,
+                    )
+                save_result = command_service.save_pending_patch_text(answer.text)
+                history_answer = answer.text if save_result.startswith("Pending patch сохранен:") else save_result
+                chat_service.save_exchange(request.history_message or argument, history_answer)
+                return ChatResponse(
+                    text=f"{answer.text}\n\n{save_result}",
+                    tokens=answer.tokens,
+                    duration_seconds=answer.duration_seconds,
+                )
+            if name == "/workspace-apply":
+                return self._text_response(command_service.workspace_apply_text())
+            if name == "/workspace-clear-patch":
+                return self._text_response(command_service.clear_pending_patch_text())
+            if name == "/workspace-diff":
+                return self._text_response(command_service.workspace_diff_text())
+
+            return self._text_response("Неизвестная команда workspace assistant.")
 
         def _text_response(self, text: str) -> ChatResponse:
             return ChatResponse(
@@ -395,6 +457,12 @@ def main() -> None:
             self._cloud_button = QPushButton("Проверить облако")
             self._project_rag_button = QPushButton("Project RAG")
             self._support_rag_button = QPushButton("Support RAG")
+            self._workspace_menu_button = QToolButton()
+            self._workspace_menu = QMenu(self)
+            self._workspace_edit_action = self._workspace_menu.addAction("Подготовить patch")
+            self._workspace_apply_action = self._workspace_menu.addAction("Применить pending patch")
+            self._workspace_diff_action = self._workspace_menu.addAction("Показать diff")
+            self._workspace_clear_patch_action = self._workspace_menu.addAction("Сбросить pending patch")
             self._checkpoint_button = QPushButton("Checkpoint")
             self._new_branch_button = QPushButton("Новая ветка")
             self._clear_button = QPushButton("Очистить")
@@ -418,6 +486,10 @@ def main() -> None:
             self._cloud_button.setFixedHeight(36)
             self._project_rag_button.setFixedHeight(36)
             self._support_rag_button.setFixedHeight(36)
+            self._workspace_menu_button.setText("Workspace")
+            self._workspace_menu_button.setMenu(self._workspace_menu)
+            self._workspace_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            self._workspace_menu_button.setFixedHeight(36)
             self._checkpoint_button.setFixedHeight(36)
             self._new_branch_button.setFixedHeight(36)
             self._support_ticket_input.setPlaceholderText("тикет опционально")
@@ -425,6 +497,7 @@ def main() -> None:
 
             self._mode_combo.addItem("Чат", "chat")
             self._mode_combo.addItem("Support", "support")
+            self._mode_combo.addItem("Workspace", "workspace")
 
             user_ids = get_available_user_ids()
             for user_id in user_ids:
@@ -462,6 +535,10 @@ def main() -> None:
             self._cloud_button.clicked.connect(self._check_cloud)
             self._project_rag_button.clicked.connect(self._build_project_rag)
             self._support_rag_button.clicked.connect(self._refresh_support_rag)
+            self._workspace_edit_action.triggered.connect(lambda _checked=False: self._prepare_workspace_patch())
+            self._workspace_apply_action.triggered.connect(lambda _checked=False: self._apply_workspace_patch())
+            self._workspace_diff_action.triggered.connect(lambda _checked=False: self._show_workspace_diff())
+            self._workspace_clear_patch_action.triggered.connect(lambda _checked=False: self._clear_workspace_patch())
             self._checkpoint_button.clicked.connect(self._save_checkpoint)
             self._new_branch_button.clicked.connect(self._create_branch)
 
@@ -479,6 +556,7 @@ def main() -> None:
             header_layout.addWidget(self._cloud_button)
             header_layout.addWidget(self._project_rag_button)
             header_layout.addWidget(self._support_rag_button)
+            header_layout.addWidget(self._workspace_menu_button)
             header_layout.addSpacing(16)
             header_layout.addWidget(QLabel("Режим:"))
             header_layout.addWidget(self._mode_combo)
@@ -512,6 +590,7 @@ def main() -> None:
             self._update_cloud_controls()
             self._update_project_rag_controls()
             self._update_support_controls()
+            self._update_workspace_controls()
             self._update_branch_controls()
             self._update_task_state()
 
@@ -603,6 +682,8 @@ def main() -> None:
             self._cloud_button.setDisabled(is_loading or self._selected_provider() != LLM_PROVIDER_CLOUD)
             self._project_rag_button.setDisabled(is_loading)
             self._support_rag_button.setDisabled(is_loading)
+            self._workspace_menu_button.setDisabled(is_loading or self._selected_mode() != "workspace")
+            self._set_workspace_action_enabled(not is_loading and self._selected_mode() == "workspace")
             self._strategy_combo.setDisabled(is_loading)
             self._branch_combo.setDisabled(is_loading)
             self._checkpoint_button.setDisabled(is_loading)
@@ -614,6 +695,7 @@ def main() -> None:
                 self._update_cloud_controls()
                 self._update_project_rag_controls()
                 self._update_support_controls()
+                self._update_workspace_controls()
                 self._update_branch_controls()
                 self._update_task_state()
 
@@ -667,6 +749,9 @@ def main() -> None:
             if text.startswith("/"):
                 return text, text
             if self._selected_mode() != "support":
+                if self._selected_mode() == "workspace":
+                    intent = workspace_intent_for_text(text)
+                    return intent.command, f"{intent.display_prefix} {text}"
                 return text, text
 
             ticket_id = self._support_ticket_input.text().strip()
@@ -687,6 +772,7 @@ def main() -> None:
 
         def _handle_mode_changed(self, *_args: Any) -> None:
             self._update_support_controls()
+            self._update_workspace_controls()
 
         def _handle_user_changed(self, *_args: Any) -> None:
             self._update_branch_controls()
@@ -737,6 +823,19 @@ def main() -> None:
             self._support_ticket_input.setDisabled(self._worker is not None or not is_support)
             self._support_rag_button.setDisabled(self._worker is not None or not is_support)
 
+        def _update_workspace_controls(self) -> None:
+            is_workspace = self._selected_mode() == "workspace"
+            is_enabled = self._worker is None and is_workspace
+            self._workspace_menu_button.setVisible(is_workspace)
+            self._workspace_menu_button.setDisabled(not is_enabled)
+            self._set_workspace_action_enabled(is_enabled)
+
+        def _set_workspace_action_enabled(self, is_enabled: bool) -> None:
+            self._workspace_edit_action.setEnabled(is_enabled)
+            self._workspace_apply_action.setEnabled(is_enabled)
+            self._workspace_diff_action.setEnabled(is_enabled)
+            self._workspace_clear_patch_action.setEnabled(is_enabled)
+
         def _build_project_rag(self) -> None:
             if self._worker is not None:
                 return
@@ -748,6 +847,31 @@ def main() -> None:
                 return
 
             self._send_text("/support-rag refresh", "Support RAG refresh")
+
+        def _prepare_workspace_patch(self) -> None:
+            if self._worker is not None:
+                return
+            text = self._input.toPlainText().strip()
+            if not text:
+                self._append_message(ERROR_AUTHOR, "Введите цель изменений перед подготовкой patch.")
+                return
+            self._send_text(f"/workspace-edit {text}", f"[Workspace edit] {text}")
+            self._input.clear()
+
+        def _apply_workspace_patch(self) -> None:
+            if self._worker is not None:
+                return
+            self._send_text("/workspace-apply", "[Workspace apply]")
+
+        def _show_workspace_diff(self) -> None:
+            if self._worker is not None:
+                return
+            self._send_text("/workspace-diff", "[Workspace diff]")
+
+        def _clear_workspace_patch(self) -> None:
+            if self._worker is not None:
+                return
+            self._send_text("/workspace-clear-patch", "[Workspace clear patch]")
 
         def _start_ollama(self) -> None:
             if self._selected_provider() != LLM_PROVIDER_OLLAMA:

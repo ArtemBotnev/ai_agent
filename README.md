@@ -26,6 +26,11 @@ AI Second is a Python CLI and PyQt assistant project. It supports OpenAI, local 
 - `scripts/review_pr.py` reviews a pull request diff with RAG and the active LLM provider.
 - `/project-rag status` shows the current project RAG index status.
 - `/help <question>` answers questions about the connected project using the RAG index and project context.
+- `/workspace <goal>` asks the MCP workspace assistant to inspect project files and answer in chat.
+- `/workspace plan <goal>` plans without writing files; `/workspace-diff` shows current git status/diff.
+- `/workspace-edit <goal>` asks the LLM to generate a unified diff and saves it as a pending patch.
+- `/workspace-apply` applies the saved pending patch through the MCP server after server-side checks.
+- `/workspace-clear-patch` deletes the saved pending patch without changing project files.
 
 The PyQt UI also supports the project assistant commands typed into the normal message input:
 
@@ -33,6 +38,15 @@ The PyQt UI also supports the project assistant commands typed into the normal m
 - `/project-rag build`
 - `/project-rag status`
 - `/help <question>`
+- `/workspace <goal>`
+- `/workspace-edit <goal>`
+- `/workspace-apply`
+- `/workspace-clear-patch`
+- `/workspace-diff`
+
+The UI also has a `Workspace` mode. In this mode regular phrases are mapped to workspace commands:
+questions become `/workspace <goal>`, edit requests such as "write code" or "implement this" become `/workspace-edit <goal>`, and apply requests become `/workspace-apply` when a pending patch exists.
+Workspace mode also shows a compact `Workspace` menu: `Подготовить patch` generates a pending patch from the current input, `Применить pending patch` applies it, `Показать diff` shows branch changes, and `Сбросить pending patch` removes the pending patch.
 
 The UI also has a `Собрать RAG` button that runs `/project-rag build`.
 
@@ -43,6 +57,8 @@ The project assistant reads its private runtime configuration from `agent_config
 The configured `project_path` points to the local repository being documented or reviewed. By default the RAG source paths can cover the whole text-based project through `source.paths`, while `source.exclude_dirs` and `source.exclude_globs` keep runtime folders, binaries, generated artifacts, and local secrets out. Embeddings are created through Ollama using the configured embedding model. The SQLite RAG index is stored outside chat history, under `rag/project_rag_index.sqlite`.
 
 When `project_assistant.mcp.enabled` is `true`, project context such as the current git branch is loaded through the configured MCP Streamable HTTP server. The example MCP URL is `http://localhost:8000`.
+
+The workspace assistant also uses this MCP server. The heavy file work happens on the server: it lists allowed files, reads relevant files, analyzes the goal, and returns evidence for the active LLM. Diff is shown through `/workspace-diff`. Source edits use an explicit two-step flow: `/workspace-edit <goal>` generates and validates a pending unified diff, then `/workspace-apply` applies it.
 
 Use `scripts/start_project_ollama.sh` to start Ollama and pull the configured embedding model before running `/project-rag build`.
 

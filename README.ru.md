@@ -59,6 +59,11 @@ python -m ui.pyqt_app
 - `/project-rag build` собирает SQLite RAG-индекс по документации проекта.
 - `/project-rag status` показывает статус RAG-индекса.
 - `/help <вопрос>` отвечает на вопросы о подключенном проекте через RAG и project context.
+- `/workspace <цель>` запускает MCP workspace assistant: он анализирует файлы проекта и отвечает в чат.
+- `/workspace plan <цель>` строит план без записи файлов; `/workspace-diff` показывает текущий git status/diff.
+- `/workspace-edit <цель>` просит LLM сгенерировать unified diff и сохраняет его как pending patch.
+- `/workspace-apply` применяет сохраненный pending patch через MCP после серверных проверок.
+- `/workspace-clear-patch` удаляет сохраненный pending patch без изменения файлов проекта.
 - `scripts/review_pr.py` делает AI-ревью PR diff через RAG и текущий LLM provider.
 
 ## PyQt UI
@@ -70,7 +75,16 @@ python -m ui.pyqt_app
 /project-rag build
 /project-rag status
 /help какая структура проекта?
+/workspace подготовь changelog по текущим изменениям
+/workspace-edit реализуй UI на Compose
+/workspace-apply
+/workspace-clear-patch
+/workspace-diff
 ```
+
+В режиме `Workspace` можно писать обычными фразами без явной команды: вопросы превращаются в `/workspace <цель>`, просьбы вроде `пиши код`, `реализуй`, `внеси изменения` — в `/workspace-edit <цель>`, а просьбы `примени`/`давай внесём` применяют pending patch через `/workspace-apply`, если он уже подготовлен.
+
+В режиме `Workspace` также появляется компактное меню `Workspace`: `Подготовить patch` генерирует pending patch из текущего текста в поле ввода, `Применить pending patch` записывает подготовленный patch в проект, `Показать diff` показывает изменения в ветке, `Сбросить pending patch` удаляет pending patch.
 
 Также в UI есть кнопка `Собрать RAG`. Она запускает тот же путь, что и команда:
 
@@ -127,6 +141,8 @@ mcp:
 ```
 
 то ассистент получает project context через MCP. Сейчас используется tool `get_git_branch`, чтобы показать текущую git-ветку в `/project` и добавить ее в контекст `/help`.
+
+Workspace assistant тоже использует этот MCP server. Тяжелая работа с файлами выполняется на стороне сервера: он обходит разрешенные файлы, читает релевантные файлы, анализирует цель и возвращает evidence для активной LLM. Diff показывается через `/workspace-diff`. Изменения исходников идут явным двухшаговым сценарием: `/workspace-edit <цель>` генерирует и проверяет pending unified diff, затем `/workspace-apply` применяет его.
 
 Если `mcp.enabled: false`, используется локальный adapter, который получает ветку через read-only git-команды.
 

@@ -36,7 +36,7 @@ from domain.message import ASSISTANT_ROLE, USER_ROLE, Message
 from domain.sticky_facts import StickyFacts
 from domain.working_memory import WorkingMemory
 
-DEFAULT_RECENT_MESSAGES_LIMIT = 6
+DEFAULT_RECENT_MESSAGES_LIMIT = 50
 MEMORY_STAGE_TURN_LIMIT = 8
 
 
@@ -142,6 +142,75 @@ class ChatService:
             ),
             duration_seconds=answer.duration_seconds,
         )
+
+    def answer_with_context(
+        self,
+        user_message: str,
+        *,
+        context: str = "",
+        saved_user_message: str | None = None,
+        save_to_history: bool = True,
+    ) -> ChatResponse:
+        clean_message = user_message.strip()
+        if not clean_message:
+            raise AgentError(AgentErrorCode.EMPTY_MESSAGE)
+
+        current_message = Message(role=USER_ROLE, content=clean_message)
+        if self._context_strategy == ContextStrategy.BRANCHING:
+            return self._answer_with_branching_and_context(current_message, context, saved_user_message)
+
+        saved_messages = self._history_repository.load()
+        messages = [*saved_messages, current_message][-self._recent_messages_limit :]
+        request_context = self._build_context(context)
+
+        current_request_tokens = self._agent.count_tokens([current_message])
+        history_tokens = self._agent.count_tokens(messages, context=request_context)
+        answer = self._agent.ask(messages, context=request_context)
+
+        if save_to_history:
+            saved_messages.append(Message(role=USER_ROLE, content=(saved_user_message or clean_message).strip()))
+            saved_messages.append(Message(role=ASSISTANT_ROLE, content=answer.text))
+            self._history_repository.save(saved_messages)
+
+        return ChatResponse(
+            text=answer.text,
+            tokens=ChatTokenUsage(
+                current_request=current_request_tokens,
+                history=history_tokens,
+                response=answer.response_tokens,
+            ),
+            duration_seconds=answer.duration_seconds,
+        )
+
+    def save_exchange(self, user_message: str, assistant_message: str) -> None:
+        clean_user_message = user_message.strip()
+        clean_assistant_message = assistant_message.strip()
+        if not clean_user_message or not clean_assistant_message:
+            return
+
+        if self._context_strategy == ContextStrategy.BRANCHING:
+            branches_state = self._branch_repository.load()
+            messages = list(branches_state.active_branch.messages)
+            messages.append(Message(role=USER_ROLE, content=clean_user_message))
+            messages.append(Message(role=ASSISTANT_ROLE, content=clean_assistant_message))
+            branches = dict(branches_state.branches)
+            branches[branches_state.active_branch_id] = ConversationBranch(
+                name=branches_state.active_branch.name,
+                messages=messages,
+            )
+            self._branch_repository.save(
+                ConversationBranches(
+                    active_branch_id=branches_state.active_branch_id,
+                    checkpoint_messages=branches_state.checkpoint_messages,
+                    branches=branches,
+                )
+            )
+            return
+
+        messages = self._history_repository.load()
+        messages.append(Message(role=USER_ROLE, content=clean_user_message))
+        messages.append(Message(role=ASSISTANT_ROLE, content=clean_assistant_message))
+        self._history_repository.save(messages)
 
     def get_context_strategy(self) -> ContextStrategy:
         return self._context_strategy
@@ -334,6 +403,47 @@ class ChatService:
         branches[branches_state.active_branch_id] = ConversationBranch(
             name=branches_state.active_branch.name,
             messages=messages,
+        )
+        self._branch_repository.save(
+            ConversationBranches(
+                active_branch_id=branches_state.active_branch_id,
+                checkpoint_messages=branches_state.checkpoint_messages,
+                branches=branches,
+            )
+        )
+
+        return ChatResponse(
+            text=answer.text,
+            tokens=ChatTokenUsage(
+                current_request=current_request_tokens,
+                history=history_tokens,
+                response=answer.response_tokens,
+            ),
+            duration_seconds=answer.duration_seconds,
+        )
+
+    def _answer_with_branching_and_context(
+        self,
+        current_message: Message,
+        context: str,
+        saved_user_message: str | None = None,
+    ) -> ChatResponse:
+        branches_state = self._branch_repository.load()
+        messages = list(branches_state.active_branch.messages)
+        messages.append(current_message)
+        request_context = self._build_context(context)
+
+        current_request_tokens = self._agent.count_tokens([current_message])
+        history_tokens = self._agent.count_tokens(messages, context=request_context)
+        answer = self._agent.ask(messages, context=request_context)
+
+        saved_messages = list(messages[:-1])
+        saved_messages.append(Message(role=USER_ROLE, content=(saved_user_message or current_message.content).strip()))
+        saved_messages.append(Message(role=ASSISTANT_ROLE, content=answer.text))
+        branches = dict(branches_state.branches)
+        branches[branches_state.active_branch_id] = ConversationBranch(
+            name=branches_state.active_branch.name,
+            messages=saved_messages,
         )
         self._branch_repository.save(
             ConversationBranches(
